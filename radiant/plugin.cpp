@@ -151,6 +151,9 @@ public:
 		m_radiantcore.Camera_getOrigin = Camera_getOrigin;
 
 		m_radiantcore.TextureBrowser_getSelectedShader = TextureBrowser_GetSelectedShader;
+		m_radiantcore.TextureBrowser_show = TextureBrowser_show;
+		m_radiantcore.TextureBrowser_isShown = TextureBrowser_isShown;
+		m_radiantcore.TextureBrowser_close = TextureBrowser_close;
 
 		m_radiantcore.m_pfnMessageBox = &qt_MessageBox;
 		m_radiantcore.m_pfnFileDialog = &file_dialog;

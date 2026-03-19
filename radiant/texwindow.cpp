@@ -624,6 +624,23 @@ void TextureBrowser_toggleShow(){
 	GroupDialog_showPage( g_page_textures );
 }
 
+void TextureBrowser_show(){
+	if ( !g_page_textures )
+		return;
+	if ( GroupDialog_isShown() && GroupDialog_getPage() == g_page_textures )
+		GroupDialog_show(); // already on textures tab — just raise/focus
+	else
+		GroupDialog_showPage( g_page_textures ); // switch to textures tab and show
+}
+
+
+bool TextureBrowser_isShown(){
+	return g_page_textures && GroupDialog_isShown() && GroupDialog_getPage() == g_page_textures;
+}
+
+void TextureBrowser_close(){
+	GroupDialog_setShown( false );
+}
 
 void TextureBrowser_updateTitle(){
 	GroupDialog_updatePageTitle( g_page_textures );

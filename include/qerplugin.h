@@ -150,6 +150,11 @@ struct _QERFuncTable_1
 	PFN_QERAPP_DIRDIALOG m_pfnDirDialog;
 	PFN_QERAPP_COLORDIALOG m_pfnColorDialog;
 	PFN_QERAPP_NEWICON m_pfnNewIcon;
+
+	// Plugin extensions — always append new members here to preserve ABI
+	void ( *TextureBrowser_show )( );
+	bool ( *TextureBrowser_isShown )( );
+	void ( *TextureBrowser_close )( );
 };
 
 #include "modulesystem.h"
