@@ -114,6 +114,16 @@ int main( int argc, char **argv ){
 			numthreads = atoi( args.takeNext() );
 		}
 
+		/* priority */
+		while ( args.takeArg( "-lowpriority" ) ) {
+			if ( ThreadSetLowPriority() ) {
+				Sys_Printf( "Running at below normal priority\n" );
+			}
+			else{
+				Sys_Warning( "Failed to lower process priority\n" );
+			}
+		}
+
 		/* max_map_draw_surfs */
 		while ( args.takeArg( "-maxmapdrawsurfs" ) ) {
 			max_map_draw_surfs = abs( atoi( args.takeNext() ) );
