@@ -198,6 +198,7 @@ static void HelpLight()
 		{ "-dirtscale", "Dirtmapping scaling factor" },
 		{ "-dirty", "Enable dirtmapping" },
 		{ "-dump", "Dump radiosity from `-bounce` into numbered MAP file prefabs" },
+		{ "-embree", "Trace rays with Intel Embree (needs a q3map2 built with Q3MAP2_EMBREE=yes): faster, nearly identical result" },
 		{ "-export", "Export lightmaps when compile finished (like `-export` mode)" },
 		{ "-exposure <F>", "Lightmap exposure to better support overbright spots" },
 		{ "-external", "Force external lightmaps even if at size of internal lightmaps" },

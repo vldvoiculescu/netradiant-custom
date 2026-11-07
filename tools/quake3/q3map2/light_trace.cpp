@@ -30,6 +30,11 @@
 
 /* dependencies */
 #include "q3map2.h"
+#include <chrono>
+#include <atomic>
+#if defined( __x86_64__ ) || defined( __i386__ )
+#include <x86intrin.h>
+#endif
 
 
 #define MAX_NODE_ITEMS          5
@@ -103,6 +108,7 @@ traceTriangle_t                 *traceTriangles = nullptr;
 
 int headNodeNum = 0, skyboxNodeNum = 0, maxTraceDepth = 0, numTraceLeafNodes = 0;
 int numTraceNodes = 0, maxTraceNodes = 0;
+int numBspTraceNodes = 0;                       /* trace nodes made from the bsp tree come first */
 traceNode_t                     *traceNodes = nullptr;
 }
 
@@ -1067,6 +1073,10 @@ static void PopulateTraceNodes(){
    creates a balanced bsp with axis-aligned splits for efficient raytracing
  */
 
+#ifdef Q3MAP2_EMBREE
+static void SetupEmbree();
+#endif
+
 void SetupTraceNodes(){
 	/* note it */
 	Sys_FPrintf( SYS_VRB, "--- SetupTraceNodes ---\n" );
@@ -1077,6 +1087,7 @@ void SetupTraceNodes(){
 
 	/* create the baseline raytracing tree from the bsp tree */
 	headNodeNum = SetupTraceNodes_r( 0 );
+	numBspTraceNodes = numTraceNodes;
 
 	/* create outside node for skybox surfaces */
 	skyboxNodeNum = AllocTraceNode();
@@ -1109,6 +1120,12 @@ void SetupTraceNodes(){
 	numTraceWindings = 0;
 	maxTraceWindings = 0;
 	deadWinding = -1;
+
+#ifdef Q3MAP2_EMBREE
+	if ( lightEmbree ) {
+		SetupEmbree();
+	}
+#endif
 
 	/* debug code: write out trace triangles to an alias obj file */
 	#if 0
@@ -1491,7 +1508,78 @@ static bool TraceLine_r( int nodeNum, const Vector3& origin, const Vector3& end,
    rewrote this function a bit :)
  */
 
+static void TraceLineInner( trace_t *trace );
+
+/* thread profiling debug counter: time spent in one function (Q3MAP2_DEBUG_COUNTER = trace (default) | sample),
+   measured with the cpu timestamp counter where available (cheap enough per call) */
+namespace
+{
+unsigned long long DebugCounterNow(){
+#if defined( __x86_64__ ) || defined( __i386__ )
+	return __rdtsc();
+#else
+	return std::chrono::steady_clock::now().time_since_epoch().count();
+#endif
+}
+
+thread_local unsigned long long debugCounterTicks = 0;
+thread_local long long debugCounterCalls = 0;
+unsigned long long debugCounterTicksStart;
+std::chrono::steady_clock::time_point debugCounterClockStart;
+
+void DebugCounterFlush(){
+	const double seconds = std::chrono::duration<double>( std::chrono::steady_clock::now() - debugCounterClockStart ).count();
+	const double ticksPerSecond = ( DebugCounterNow() - debugCounterTicksStart ) / std::max( seconds, 1e-6 );
+	ThreadProfileAddCounter( debugCounterTicks / ticksPerSecond, debugCounterCalls );
+	debugCounterTicks = 0;
+	debugCounterCalls = 0;
+}
+
+const char *DebugCounterSetup(){
+	if ( !ThreadProfileEnabled() ) {
+		return "";
+	}
+	debugCounterTicksStart = DebugCounterNow();
+	debugCounterClockStart = std::chrono::steady_clock::now();
+	threadProfileFlush = DebugCounterFlush;
+	const char *name = getenv( "Q3MAP2_DEBUG_COUNTER" );
+	return name != nullptr ? name : "trace";
+}
+}
+
+bool DebugCounterEnabled( const char *name ){
+	static const char *counter = DebugCounterSetup();
+	return strEqual( counter, name );
+}
+
+unsigned long long DebugCounterStart(){
+	return DebugCounterNow();
+}
+
+void DebugCounterStop( unsigned long long start ){
+	debugCounterTicks += DebugCounterNow() - start;
+	++debugCounterCalls;
+}
+
 void TraceLine( trace_t *trace ){
+	static const bool counted = DebugCounterEnabled( "trace" );
+	if ( counted ) {
+		const unsigned long long start = DebugCounterStart();
+		TraceLineInner( trace );
+		DebugCounterStop( start );
+	}
+	else{
+		TraceLineInner( trace );
+	}
+}
+
+static void TraceLineTree( trace_t *trace );
+#ifdef Q3MAP2_EMBREE
+static void TraceLineEmbree( trace_t *trace );
+static void EmbreeCheck( const trace_t& reference, const trace_t& trace );
+#endif
+
+static void TraceLineInner( trace_t *trace ){
 	/* setup output (note: this code assumes the input data is completely filled out) */
 	trace->passSolid = false;
 	trace->opaque = false;
@@ -1504,8 +1592,43 @@ void TraceLine( trace_t *trace ){
 		return;
 	}
 
+#ifdef Q3MAP2_EMBREE
+	if ( lightEmbree ) {
+		/* debugging aid: env Q3MAP2_DEBUG_EMBREE_CHECK runs both tracers on every ray and reports differences */
+		if ( static const bool check = getenv( "Q3MAP2_DEBUG_EMBREE_CHECK" ) != nullptr; check ) {
+			trace_t reference = *trace;
+			TraceLineEmbree( trace );
+			TraceLineTree( &reference );
+			EmbreeCheck( reference, *trace );
+		}
+		else{
+			TraceLineEmbree( trace );
+		}
+		return;
+	}
+#endif
+
+	TraceLineTree( trace );
+}
+
+/* TraceLine() with the trace node tree, after its setup and early outs */
+static void TraceLineTree( trace_t *trace ){
 	/* trace through nodes */
 	TraceLine_r( headNodeNum, trace->origin, trace->end, trace );
+
+	/* debugging aid: env Q3MAP2_DEBUG_TESTNODES counts rays whose node list is full, so later nodes' triangles are not tested */
+	if ( static const bool debugTestNodes = getenv( "Q3MAP2_DEBUG_TESTNODES" ) != nullptr; debugTestNodes ) {
+		static std::atomic<long long> rays, full, fullSun;
+		static const struct Report { ~Report(){ fprintf( stderr, "testnodes: %lld rays, %lld with full node list (%lld testAll)\n", rays.load(), full.load(), fullSun.load() ); } } report;
+		++rays;
+		if ( trace->numTestNodes >= MAX_TRACE_TEST_NODES ) {
+			++full;
+			if ( trace->testAll ) {
+				++fullSun;
+			}
+		}
+	}
+
 	if ( trace->passSolid && !trace->testAll ) {
 		trace->opaque = true;
 		return;
@@ -1543,6 +1666,622 @@ void TraceLine( trace_t *trace ){
 		}
 	}
 }
+
+
+
+#ifdef Q3MAP2_EMBREE
+/* -------------------------------------------------------------------------------
+
+   -embree: Intel Embree finds the triangles a ray hits, instead of walking the trace node tree.
+
+   the result is meant to match TraceLine(): Embree is given the same triangles (the clipped pieces
+   from the trace nodes), slightly enlarged so it reports every triangle that TraceTriangle() could
+   accept with its epsilons, and a filter callback runs the exact TraceTriangle() tests on each one.
+   the bsp tree is still walked for solid space, like TraceLine_r() does, but not its subdivision.
+   what differs is the order hits are found in: TraceLine() stops at the first opaque triangle in
+   tree order, this uses the nearest one, and applies alpha/filter shadows in distance order.
+
+   ------------------------------------------------------------------------------- */
+
+#include <embree4/rtcore.h>
+
+namespace
+{
+RTCDevice embreeDevice = nullptr;
+RTCScene embreeScene = nullptr;
+std::vector<int> embreeTriangles;               /* embree primitive id -> traceTriangles index */
+std::vector<int> embreeTriangleLeaves;          /* embree primitive id -> trace node (leaf) holding the triangle */
+std::vector<int> embreeTriangleItems;           /* embree primitive id -> position in the leaf's items */
+std::vector<int> traceNodeParents;
+
+/* how much the triangles are enlarged around their center. TraceTriangle() accepts barycentric
+   coordinates up to BARY_EPSILON outside the triangle, which equals scaling it by 1 + 3 * BARY_EPSILON */
+const float embreeTriangleScale = 1.06f;
+
+/* outcome of the TraceTriangle() tests for one triangle */
+enum class TriangleTest { Ignored, Flags, Sky, Filter, Opaque };
+
+struct TriangleResult
+{
+	TriangleTest test = TriangleTest::Ignored;
+	float depth;
+	int tri;
+	bool inMargin;                              /* hit within BARY_EPSILON outside the triangle */
+	float leafEntry;                            /* TraceLine() tests leaves in the order the ray enters them, */
+	int item;                                   /* then the triangles in a leaf in item order */
+	Vector3 filterColor;                        /* Filter: lightfilter color, or 1 */
+	float filterShadow;                         /* Filter: alphashadow factor, or 1 */
+	bool hasFilterColor, hasFilterShadow;
+};
+
+/* TraceTriangle() without changing the trace: classifies the triangle */
+TriangleResult TestTraceTriangle( int tri, const trace_t& trace ){
+	TriangleResult r;
+	r.tri = tri;
+	const traceTriangle_t& tt = traceTriangles[ tri ];
+	const traceInfo_t& ti = traceInfos[ tt.infoNum ];
+	const shaderInfo_t *si = ti.si;
+
+	/* worldspawn group only receives shadows from positive groups */
+	if ( trace.recvShadows == 1 ) {
+		if ( ti.castShadows <= 0 ) {
+			return r;
+		}
+	}
+	/* receive shadows from same group and worldspawn group */
+	else if ( trace.recvShadows > 1 ) {
+		if ( ti.castShadows != 1 && abs( ti.castShadows ) != abs( trace.recvShadows ) ) {
+			return r;
+		}
+	}
+	/* receive shadows from the same group only (< 0) */
+	else
+	{
+		if ( abs( ti.castShadows ) != abs( trace.recvShadows ) ) {
+			return r;
+		}
+	}
+
+	/* skip patches when doing the grid (FIXME this is an ugly hack) */
+	if ( inGrid && ti.skipGrid ) {
+		return r;
+	}
+
+	/* begin calculating determinant - also used to calculate u parameter */
+	const Vector3 pvec = vector3_cross( trace.direction, tt.edge2 );
+
+	/* if determinant is near zero, trace lies in plane of triangle */
+	const float det = vector3_dot( tt.edge1, pvec );
+	if ( std::fabs( det ) < COPLANAR_EPSILON ) {
+		return r;
+	}
+	const float invDet = 1.0f / det;
+
+	/* calculate distance from first vertex to ray origin */
+	const Vector3 tvec = trace.origin - tt.v[ 0 ].xyz;
+
+	/* calculate u parameter and test bounds */
+	const float u = vector3_dot( tvec, pvec ) * invDet;
+	if ( u < -BARY_EPSILON || u > ( 1.0f + BARY_EPSILON ) ) {
+		return r;
+	}
+
+	/* prepare to test v parameter */
+	const Vector3 qvec = vector3_cross( tvec, tt.edge1 );
+
+	/* calculate v parameter and test bounds */
+	const float v = vector3_dot( trace.direction, qvec ) * invDet;
+	if ( v < -BARY_EPSILON || ( u + v ) > ( 1.0f + BARY_EPSILON ) ) {
+		return r;
+	}
+
+	r.inMargin = u < 0 || v < 0 || ( u + v ) > 1;
+
+	/* calculate t (depth) */
+	r.depth = vector3_dot( tt.edge2, qvec ) * invDet;
+	if ( r.depth <= trace.inhibitRadius || r.depth >= trace.distance ) {
+		return r;
+	}
+
+	/* if hitpoint is really close to trace origin (sample point), then check for self-shadowing */
+	if ( r.depth <= SELF_SHADOW_EPSILON ) {
+		for ( int i : Span( trace.surfaces, trace.numSurfaces ) )
+		{
+			if ( ti.surfaceNum == i ) {
+				return r;
+			}
+		}
+	}
+
+	/* from here on the triangle's compile flags are stacked */
+	r.test = TriangleTest::Flags;
+
+	/* don't trace against sky */
+	if ( si->compileFlags & C_SKY ) {
+		r.test = TriangleTest::Sky;
+		return r;
+	}
+
+	/* most surfaces are completely opaque */
+	if ( !( si->compileFlags & ( C_ALPHASHADOW | C_LIGHTFILTER ) ) ||
+	     si->lightImage == nullptr || si->lightImage->pixels == nullptr ) {
+		r.test = TriangleTest::Opaque;
+		return r;
+	}
+
+	/* force subsampling because the lighting is texture dependent: stays TriangleTest::Flags + filter shader */
+
+	/* try to avoid double shadows near triangle seams */
+	if ( u < -ASLF_EPSILON || u > ( 1.0f + ASLF_EPSILON ) ||
+	     v < -ASLF_EPSILON || ( u + v ) > ( 1.0f + ASLF_EPSILON ) ) {
+		return r;
+	}
+
+	/* calculate w parameter */
+	const float w = 1.0f - ( u + v );
+
+	/* calculate st from uvw (barycentric) coordinates */
+	float s = w * tt.v[ 0 ].st[ 0 ] + u * tt.v[ 1 ].st[ 0 ] + v * tt.v[ 2 ].st[ 0 ];
+	float t = w * tt.v[ 0 ].st[ 1 ] + u * tt.v[ 1 ].st[ 1 ] + v * tt.v[ 2 ].st[ 1 ];
+	s = s - floor( s );
+	t = t - floor( t );
+	const int is = std::clamp( int( s * si->lightImage->width ), 0, si->lightImage->width - 1 );
+	const int it = std::clamp( int( t * si->lightImage->height ), 0, si->lightImage->height - 1 );
+
+	/* get pixel */
+	const byte *pixel = si->lightImage->pixels + 4 * ( it * si->lightImage->width + is );
+
+	r.test = TriangleTest::Filter;
+	r.hasFilterColor = si->compileFlags & C_LIGHTFILTER;
+	r.hasFilterShadow = si->compileFlags & C_ALPHASHADOW;
+	r.filterColor = Vector3( pixel[0], pixel[1], pixel[2] ) * ( 1.0f / 255.0f );
+	r.filterShadow = ( 1.0f / 255.0f ) * ( 255 - pixel[ 3 ] );
+	return r;
+}
+
+/* whether TraceLine_r() visits the leaf when walking from origin to end (same plane tests and splits);
+   entry is set to where the ray enters it */
+bool RayPassesLeaf( int leaf, Vector3 origin, Vector3 end, Vector3& entry ){
+	int path[ 512 ];
+	int depth = 0;
+	for ( int n = leaf; n >= 0 && depth < int( std::size( path ) ); n = traceNodeParents[ n ] )
+		path[ depth++ ] = n;
+
+	for ( int i = depth - 1; i > 0; --i )
+	{
+		const traceNode_t& node = traceNodes[ path[ i ] ];
+		const int side = node.children[ 0 ] == path[ i - 1 ] ? 0 : 1;
+
+		float front, back;
+		switch ( node.type )
+		{
+		case ePlaneX:
+			front = origin[ 0 ] - node.plane.dist();
+			back = end[ 0 ] - node.plane.dist();
+			break;
+		case ePlaneY:
+			front = origin[ 1 ] - node.plane.dist();
+			back = end[ 1 ] - node.plane.dist();
+			break;
+		case ePlaneZ:
+			front = origin[ 2 ] - node.plane.dist();
+			back = end[ 2 ] - node.plane.dist();
+			break;
+		default:
+			front = plane3_distance_to_point( node.plane, origin );
+			back = plane3_distance_to_point( node.plane, end );
+			break;
+		}
+
+		if ( front >= -TRACE_ON_EPSILON && back >= -TRACE_ON_EPSILON ) {
+			if ( side != 0 ) {
+				return false;
+			}
+		}
+		else if ( front < TRACE_ON_EPSILON && back < TRACE_ON_EPSILON ) {
+			if ( side != 1 ) {
+				return false;
+			}
+		}
+		else
+		{
+			const int first = front < 0;
+			const Vector3 mid = origin + ( end - origin ) * ( front / ( front - back ) );
+			if ( side == first ) {
+				end = mid;
+			}
+			else{
+				origin = mid;
+			}
+		}
+	}
+	entry = origin;
+	return true;
+}
+
+/* TestTraceTriangle() for an embree primitive: TraceLine() only tests a triangle when the ray passes its leaf.
+   that limits the BARY_EPSILON margin of triangles clipped by the trace nodes to their own leaf, and with
+   TRACE_ON_EPSILON it skips leaves that a ray running along a node plane only touches */
+TriangleResult ClassifyTriangle( unsigned primID, const trace_t& trace ){
+	TriangleResult r = TestTraceTriangle( embreeTriangles[ primID ], trace );
+	if ( r.test != TriangleTest::Ignored ) {
+		Vector3 entry;
+		if ( RayPassesLeaf( embreeTriangleLeaves[ primID ], trace.origin, trace.end, entry ) ) {
+			r.leafEntry = vector3_length( entry - trace.origin );
+			r.item = embreeTriangleItems[ primID ];
+		}
+		else{
+			r.test = TriangleTest::Ignored;
+		}
+	}
+	return r;
+}
+
+/* the order TraceLine() tests triangles in */
+bool TreeOrderLess( const TriangleResult& a, const TriangleResult& b ){
+	return a.leafEntry < b.leafEntry || ( a.leafEntry == b.leafEntry && a.item < b.item );
+}
+
+/* the ray query context: embree passes it to the filter callback */
+struct EmbreeQuery
+{
+	RTCRayQueryContext context;                 /* must be first */
+	const trace_t *trace;
+	bool treeOrder;                             /* find the opaque triangle TraceLine() finds first, not the nearest */
+};
+
+/* triangles that don't stop the ray but count for its result, collected during a query */
+thread_local std::vector<TriangleResult> embreePassedTriangles;
+
+void EmbreeFilter( const RTCFilterFunctionNArguments *args ){
+	const EmbreeQuery& query = *reinterpret_cast<const EmbreeQuery*>( args->context );
+	const TriangleResult r = ClassifyTriangle( RTCHitN_primID( args->hit, args->N, 0 ), *query.trace );
+	if ( r.test == TriangleTest::Opaque && !query.treeOrder ) {
+		return; /* accept: embree keeps the nearest */
+	}
+	args->valid[ 0 ] = 0;
+	if ( r.test != TriangleTest::Ignored ) {
+		/* embree may report a triangle more than once */
+		for ( const TriangleResult& passed : embreePassedTriangles )
+		{
+			if ( passed.tri == r.tri ) {
+				return;
+			}
+		}
+		embreePassedTriangles.push_back( r );
+	}
+}
+
+/* walks the bsp part of the trace node tree like TraceLine_r(), only to find solid space;
+   nodes from SubdivideTraceNode_r() can't be solid */
+bool TraceSolid_r( int nodeNum, const Vector3& origin, const Vector3& end, trace_t *trace ){
+	/* bogus node number means solid, end tracing unless testing all */
+	if ( nodeNum < 0 ) {
+		trace->hit = origin;
+		trace->passSolid = true;
+		return true;
+	}
+	if ( nodeNum >= numBspTraceNodes ) {
+		return false;
+	}
+
+	const traceNode_t& node = traceNodes[ nodeNum ];
+
+	/* solid? */
+	if ( node.type == TRACE_LEAF_SOLID ) {
+		trace->hit = origin;
+		trace->passSolid = true;
+		return true;
+	}
+
+	/* leafnode? */
+	if ( node.type < 0 ) {
+		return false;
+	}
+
+	/* ydnar 2003-09-07: don't test branches of the bsp with nothing in them when testall is enabled */
+	if ( trace->testAll && node.numItems == 0 ) {
+		return false;
+	}
+
+	/* classify beginning and end points */
+	float front, back;
+	switch ( node.type )
+	{
+	case ePlaneX:
+		front = origin[ 0 ] - node.plane.dist();
+		back = end[ 0 ] - node.plane.dist();
+		break;
+
+	case ePlaneY:
+		front = origin[ 1 ] - node.plane.dist();
+		back = end[ 1 ] - node.plane.dist();
+		break;
+
+	case ePlaneZ:
+		front = origin[ 2 ] - node.plane.dist();
+		back = end[ 2 ] - node.plane.dist();
+		break;
+
+	default:
+		front = plane3_distance_to_point( node.plane, origin );
+		back = plane3_distance_to_point( node.plane, end );
+		break;
+	}
+
+	/* entirely in front side? */
+	if ( front >= -TRACE_ON_EPSILON && back >= -TRACE_ON_EPSILON ) {
+		return TraceSolid_r( node.children[ 0 ], origin, end, trace );
+	}
+
+	/* entirely on back side? */
+	if ( front < TRACE_ON_EPSILON && back < TRACE_ON_EPSILON ) {
+		return TraceSolid_r( node.children[ 1 ], origin, end, trace );
+	}
+
+	/* select side */
+	const int side = front < 0;
+
+	/* calculate intercept point */
+	const float frac = front / ( front - back );
+	const Vector3 mid = origin + ( end - origin ) * frac;
+
+	/* trace first side, then the other */
+	return TraceSolid_r( node.children[ side ], origin, mid, trace )
+	    || TraceSolid_r( node.children[ !side ], mid, end, trace );
+}
+
+void EmbreeError( void *, RTCError code, const char *message ){
+	Error( "Embree error %d: %s", int( code ), message );
+}
+
+/* adds the triangles in the leaves of a trace node tree */
+void CollectTraceTriangles_r( int nodeNum ){
+	if ( nodeNum < 0 || nodeNum >= numTraceNodes ) {
+		return;
+	}
+	const traceNode_t& node = traceNodes[ nodeNum ];
+	if ( node.type >= 0 ) {
+		traceNodeParents[ node.children[ 0 ] ] = nodeNum;
+		traceNodeParents[ node.children[ 1 ] ] = nodeNum;
+		CollectTraceTriangles_r( node.children[ 0 ] );
+		CollectTraceTriangles_r( node.children[ 1 ] );
+	}
+	else if ( node.type == TRACE_LEAF ) {
+		embreeTriangles.insert( embreeTriangles.end(), node.items, node.items + node.numItems );
+		embreeTriangleLeaves.insert( embreeTriangleLeaves.end(), node.numItems, nodeNum );
+		for ( int i = 0; i < node.numItems; ++i )
+			embreeTriangleItems.push_back( i );
+	}
+}
+}
+
+/*
+   SetupEmbree()
+   builds the embree scene from the trace triangles, after SetupTraceNodes()
+ */
+
+static void SetupEmbree(){
+	Sys_Printf( "--- SetupEmbree ---\n" );
+
+	embreeDevice = rtcNewDevice( nullptr );
+	if ( embreeDevice == nullptr ) {
+		Error( "Embree: failed to create device (error %d)", int( rtcGetDeviceError( nullptr ) ) );
+	}
+	rtcSetDeviceErrorFunction( embreeDevice, EmbreeError, nullptr );
+
+	embreeTriangles.clear();
+	embreeTriangleLeaves.clear();
+	embreeTriangleItems.clear();
+	traceNodeParents.assign( numTraceNodes, -1 );
+	CollectTraceTriangles_r( headNodeNum );
+
+	RTCGeometry geometry = rtcNewGeometry( embreeDevice, RTC_GEOMETRY_TYPE_TRIANGLE );
+	float *vertices = static_cast<float*>( rtcSetNewGeometryBuffer( geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT3, 3 * sizeof( float ), embreeTriangles.size() * 3 ) );
+	unsigned *indexes = static_cast<unsigned*>( rtcSetNewGeometryBuffer( geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT3, 3 * sizeof( unsigned ), embreeTriangles.size() ) );
+	for ( size_t i = 0; i < embreeTriangles.size(); ++i )
+	{
+		const traceTriangle_t& tt = traceTriangles[ embreeTriangles[ i ] ];
+		const Vector3 center = ( tt.v[ 0 ].xyz + tt.v[ 1 ].xyz + tt.v[ 2 ].xyz ) * ( 1.0f / 3.0f );
+		for ( int j = 0; j < 3; ++j )
+		{
+			const Vector3 xyz = center + ( tt.v[ j ].xyz - center ) * embreeTriangleScale;
+			vertices[ i * 9 + j * 3 + 0 ] = xyz[ 0 ];
+			vertices[ i * 9 + j * 3 + 1 ] = xyz[ 1 ];
+			vertices[ i * 9 + j * 3 + 2 ] = xyz[ 2 ];
+			indexes[ i * 3 + j ] = i * 3 + j;
+		}
+	}
+	rtcSetGeometryEnableFilterFunctionFromArguments( geometry, true );
+	rtcCommitGeometry( geometry );
+
+	embreeScene = rtcNewScene( embreeDevice );
+	rtcSetSceneFlags( embreeScene, RTC_SCENE_FLAG_FILTER_FUNCTION_IN_ARGUMENTS );
+	rtcAttachGeometry( embreeScene, geometry );
+	rtcReleaseGeometry( geometry );
+	rtcCommitScene( embreeScene );
+
+	Sys_Printf( "%9zu embree triangles\n", embreeTriangles.size() );
+}
+
+/*
+   TraceLineEmbree()
+   TraceLine() for -embree, called after its setup and early outs
+ */
+
+static void TraceLineEmbree( trace_t *trace ){
+	/* solid space */
+	float segment = trace->distance;
+	if ( TraceSolid_r( headNodeNum, trace->origin, trace->end, trace ) ) {
+		if ( !trace->testAll ) {
+			trace->opaque = true;
+			return;
+		}
+		/* TraceLine_r() stops collecting nodes at solid space: surfaces up to its edge (e.g. sky) count */
+		segment = std::min( segment, float( vector3_length( trace->hit - trace->origin ) ) + 1.0f );
+	}
+
+	/* skip surfaces? */
+	if ( noSurfaces ) {
+		return;
+	}
+
+	/* find the nearest opaque triangle, collecting the sky and filter ones on the way */
+	embreePassedTriangles.clear();
+
+	EmbreeQuery query;
+	rtcInitRayQueryContext( &query.context );
+	query.trace = trace;
+	/* -dirty and floodlight rays (no light) use the hit distance: that depends on which opaque triangle is found */
+	query.treeOrder = trace->light == nullptr;
+
+	RTCIntersectArguments args;
+	rtcInitIntersectArguments( &args );
+	args.context = &query.context;
+	args.filter = EmbreeFilter;
+	args.flags = RTC_RAY_QUERY_FLAG_INVOKE_ARGUMENT_FILTER;
+
+	RTCRayHit rayhit;
+	rayhit.ray.org_x = trace->origin[ 0 ];
+	rayhit.ray.org_y = trace->origin[ 1 ];
+	rayhit.ray.org_z = trace->origin[ 2 ];
+	rayhit.ray.dir_x = trace->direction[ 0 ];
+	rayhit.ray.dir_y = trace->direction[ 1 ];
+	rayhit.ray.dir_z = trace->direction[ 2 ];
+	rayhit.ray.tnear = 0;
+	rayhit.ray.tfar = segment;
+	rayhit.ray.time = 0;
+	rayhit.ray.mask = -1;
+	rayhit.ray.id = 0;
+	rayhit.ray.flags = 0;
+	rayhit.hit.geomID = RTC_INVALID_GEOMETRY_ID;
+	rayhit.hit.instID[ 0 ] = RTC_INVALID_GEOMETRY_ID;
+	rtcIntersect1( embreeScene, &rayhit, &args );
+
+	TriangleResult opaque;
+	if ( rayhit.hit.geomID != RTC_INVALID_GEOMETRY_ID ) {
+		opaque = ClassifyTriangle( rayhit.hit.primID, *trace );
+	}
+
+	/* apply the passed triangles that TraceLine() tests before the opaque one, in its order */
+	std::sort( embreePassedTriangles.begin(), embreePassedTriangles.end(), TreeOrderLess );
+	if ( query.treeOrder ) {
+		for ( const TriangleResult& r : embreePassedTriangles )
+		{
+			if ( r.test == TriangleTest::Opaque ) {
+				opaque = r;
+				break;
+			}
+		}
+	}
+	for ( const TriangleResult& r : embreePassedTriangles )
+	{
+		if ( opaque.test == TriangleTest::Opaque && !TreeOrderLess( r, opaque ) ) {
+			break;
+		}
+
+		const shaderInfo_t *si = traceInfos[ traceTriangles[ r.tri ].infoNum ].si;
+
+		/* don't double-trace against sky */
+		if ( trace->compileFlags & si->compileFlags & C_SKY ) {
+			continue;
+		}
+
+		/* stack compile flags */
+		trace->compileFlags |= si->compileFlags;
+
+		if ( r.test == TriangleTest::Sky ) {
+			if( !g_oneSky && trace->light != nullptr /* 0 for -dirty */ && trace->light->skyIndex != -1 && si->skyIndex != -1 )
+				bit_enable( trace->skyIndices, si->skyIndex );
+			continue;
+		}
+
+		/* alphashadow / lightfilter shader */
+		trace->forceSubsampling = 1;
+		if ( r.test != TriangleTest::Filter ) {
+			continue;
+		}
+
+		/* ydnar: color filter */
+		if ( r.hasFilterColor ) {
+			trace->color *= r.filterColor;
+		}
+
+		/* ydnar: alpha filter */
+		if ( r.hasFilterShadow ) {
+			trace->color *= r.filterShadow;
+		}
+
+		/* check filter for opaque */
+		if ( trace->color[ 0 ] <= 0.001f && trace->color[ 1 ] <= 0.001f && trace->color[ 2 ] <= 0.001f ) {
+			trace->color.set( 0 );
+			trace->hit = trace->origin + trace->direction * r.depth;
+			trace->opaque = true;
+			return;
+		}
+	}
+
+	/* opaque triangle */
+	if ( opaque.test == TriangleTest::Opaque ) {
+		trace->compileFlags |= traceInfos[ traceTriangles[ opaque.tri ].infoNum ].si->compileFlags;
+		trace->hit = trace->origin + trace->direction * opaque.depth;
+		trace->color.set( 0 );
+		trace->opaque = true;
+	}
+}
+
+/* Q3MAP2_DEBUG_EMBREE_CHECK: counts how the -embree result differs from TraceLine_r()'s */
+static void EmbreeCheck( const trace_t& reference, const trace_t& trace ){
+	enum { Rays, OpaqueOnlyEmbree, OpaqueOnlyTree, Color, Flags, Sky, ForceSubsampling, HitDistance, LitOnlyEmbree, LitOnlyTree, LitOnlyTreeFullNodes, Count };
+	static std::atomic<long long> counts[ Count ];
+	static std::atomic<int> printed;
+	static const struct Report {
+		~Report(){
+			fprintf( stderr, "embree check: %lld rays; lit only with embree %lld, only with tree %lld (%lld with full node list); opaque only with embree %lld, only with tree %lld; color %lld; compile flags %lld; sky %lld; forceSubsampling %lld; hit distance %lld\n",
+			         counts[ Rays ].load(), counts[ LitOnlyEmbree ].load(), counts[ LitOnlyTree ].load(), counts[ LitOnlyTreeFullNodes ].load(), counts[ OpaqueOnlyEmbree ].load(), counts[ OpaqueOnlyTree ].load(), counts[ Color ].load(),
+			         counts[ Flags ].load(), counts[ Sky ].load(), counts[ ForceSubsampling ].load(), counts[ HitDistance ].load() );
+		}
+	} report;
+
+	++counts[ Rays ];
+
+	/* what the caller makes of it: sun / sky light (testAll) needs to reach the sky */
+	const auto lit = []( const trace_t& t ){
+		return !t.opaque && ( !t.testAll || ( t.compileFlags & C_SKY ) );
+	};
+	if ( lit( trace ) != lit( reference ) ) {
+		++counts[ lit( trace ) ? LitOnlyEmbree : LitOnlyTree ];
+		if ( !lit( trace ) && reference.numTestNodes >= MAX_TRACE_TEST_NODES ) {
+			++counts[ LitOnlyTreeFullNodes ];
+		}
+		if ( printed++ < 12 ) {
+			fprintf( stderr, "embree check lit only with %s: origin ( %g %g %g ) end ( %g %g %g ) testAll %d; tree opaque %d hit %g flags %x; embree opaque %d hit %g flags %x\n",
+			         lit( trace ) ? "embree" : "tree", reference.origin[ 0 ], reference.origin[ 1 ], reference.origin[ 2 ], reference.end[ 0 ], reference.end[ 1 ], reference.end[ 2 ], reference.testAll,
+			         reference.opaque, vector3_length( reference.hit - reference.origin ), reference.compileFlags,
+			         trace.opaque, vector3_length( trace.hit - trace.origin ), trace.compileFlags );
+		}
+	}
+	if ( trace.opaque != reference.opaque ) {
+		++counts[ trace.opaque ? OpaqueOnlyEmbree : OpaqueOnlyTree ];
+		return;
+	}
+	if ( trace.color != reference.color ) {
+		++counts[ Color ];
+	}
+	if ( trace.compileFlags != reference.compileFlags ) {
+		++counts[ Flags ];
+	}
+	if ( memcmp( trace.skyIndices, reference.skyIndices, sizeof( trace.skyIndices ) ) ) {
+		++counts[ Sky ];
+	}
+	if ( trace.forceSubsampling != reference.forceSubsampling ) {
+		++counts[ ForceSubsampling ];
+	}
+	if ( trace.opaque && std::fabs( vector3_length( trace.hit - trace.origin ) - vector3_length( reference.hit - reference.origin ) ) > 0.01f ) {
+		++counts[ HitDistance ];
+	}
+}
+#endif
 
 
 

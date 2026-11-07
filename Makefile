@@ -96,6 +96,12 @@ else
 CPPFLAGS_ASSIMP    := -Ilibs/assimp/include -DASSIMP_INCLUDE\(x\)=\#x
 LIBS_ASSIMP        := -lassimp_ -L$(INSTALLDIR)
 endif
+# optional Intel Embree 4 ray tracer for q3map2 -light -embree
+Q3MAP2_EMBREE      ?= no
+ifeq ($(Q3MAP2_EMBREE),yes)
+CPPFLAGS_EMBREE    ?= -DQ3MAP2_EMBREE
+LIBS_EMBREE        ?= -lembree4
+endif
 CPPFLAGS_GL        ?=
 LIBS_GL            ?= -lGL # -lopengl32 on Win32
 CPPFLAGS_DL        ?=
@@ -544,8 +550,8 @@ ifeq ($(ASSIMP_INTERNAL),yes)
 $(INSTALLDIR)/q3map2.$(EXE): LDFLAGS_EXTRA += -Wl,-rpath '-Wl,$$ORIGIN'
 endif
 endif
-$(INSTALLDIR)/q3map2.$(EXE): LIBS_EXTRA := $(LIBS_XML) $(LIBS_GLIB) $(LIBS_PNG) $(LIBS_JPEG) $(LIBS_ZLIB) $(LIBS_ASSIMP)
-$(INSTALLDIR)/q3map2.$(EXE): CPPFLAGS_EXTRA := $(CPPFLAGS_XML) $(CPPFLAGS_GLIB) $(CPPFLAGS_PNG) $(CPPFLAGS_JPEG) -Itools/quake3/common -Ilibs -Iinclude $(CPPFLAGS_ASSIMP)
+$(INSTALLDIR)/q3map2.$(EXE): LIBS_EXTRA := $(LIBS_XML) $(LIBS_GLIB) $(LIBS_PNG) $(LIBS_JPEG) $(LIBS_ZLIB) $(LIBS_ASSIMP) $(LIBS_EMBREE)
+$(INSTALLDIR)/q3map2.$(EXE): CPPFLAGS_EXTRA := $(CPPFLAGS_XML) $(CPPFLAGS_GLIB) $(CPPFLAGS_PNG) $(CPPFLAGS_JPEG) -Itools/quake3/common -Ilibs -Iinclude $(CPPFLAGS_ASSIMP) $(CPPFLAGS_EMBREE)
 $(INSTALLDIR)/q3map2.$(EXE): \
 	tools/quake3/common/cmdlib.o \
 	tools/quake3/common/qimagelib.o \

@@ -1800,6 +1800,9 @@ int                         LightMain( Args& args );
 /* light_trace.c */
 void                        SetupTraceNodes();
 void                        TraceLine( trace_t *trace );
+bool                        DebugCounterEnabled( const char *name );
+unsigned long long          DebugCounterStart();
+void                        DebugCounterStop( unsigned long long start );
 float                       SetupTrace( trace_t *trace );
 
 
@@ -2096,6 +2099,7 @@ inline bool noGridLighting;
 
 inline bool noTrace;
 inline bool noSurfaces;
+inline bool lightEmbree;                /* -embree: trace rays with Intel Embree */
 inline bool patchShadows;
 inline bool cpmaHack;
 

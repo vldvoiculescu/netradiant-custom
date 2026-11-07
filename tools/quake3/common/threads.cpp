@@ -133,6 +133,23 @@ ThreadProfile g_threadProfile;
 #include <mutex>
 #include <condition_variable>
 
+void ( *threadProfileFlush )() = nullptr;
+
+namespace
+{
+std::atomic<double> g_counterSeconds;
+std::atomic<long long> g_counterCalls;
+}
+
+bool ThreadProfileEnabled(){
+	return g_threadProfile.file != nullptr;
+}
+
+void ThreadProfileAddCounter( double seconds, long long calls ){
+	g_counterSeconds.fetch_add( seconds );
+	g_counterCalls.fetch_add( calls );
+}
+
 bool threadsHelpWithJobs = false;
 
 namespace
@@ -251,6 +268,10 @@ void ThreadWorkerFunction( int threadnum ){
 			g_jobCond.wait( lock );
 		}
 	}
+
+	if ( threadProfileFlush != nullptr && g_threadProfile.file != nullptr ) {
+		threadProfileFlush();
+	}
 }
 
 static void ThreadProfileReport( int workcnt, bool showpacifier, double start ){
@@ -277,6 +298,9 @@ static void ThreadProfileReport( int workcnt, bool showpacifier, double start ){
 	fprintf( p.file, "call %d pacifier %d items %d threads %d start %.4f serial_before %.4f wall %.4f busy %.4f efficiency %.3f last_dispatch %.4f tail %.4f max_item %.4f\n",
 	         p.call, showpacifier, workcnt, numthreads, start, start - p.lastEnd, wall, busy,
 	         wall > 0 ? busy / ( wall * std::max( numthreads, 1 ) ) : 1.0, lastStart - start, end - lastStart, maxItem );
+	if ( g_counterCalls != 0 ) {
+		fprintf( p.file, "  counter %.4f s, %lld calls, %.1f%% of busy\n", g_counterSeconds.load(), g_counterCalls.load(), busy > 0 ? 100 * g_counterSeconds.load() / busy : 0.0 );
+	}
 	fprintf( p.file, "  slowest" );
 	for ( int i = 0; i < top; ++i )
 		fprintf( p.file, " %d:%.4f@%.4f", order[ i ], p.items[ order[ i ] ].end - p.items[ order[ i ] ].start, p.items[ order[ i ] ].start - start );
@@ -300,6 +324,8 @@ void RunThreadsOnIndividual( int workcnt, bool showpacifier, void ( *func )( int
 	if ( g_threadProfile.file != nullptr ) {
 		g_threadProfile.items.assign( workcnt, ProfileItem{ profileStart, profileStart, -1 } );
 		g_helpSeconds = 0;
+		g_counterSeconds = 0;
+		g_counterCalls = 0;
 	}
 	g_itemsDone = 0;
 

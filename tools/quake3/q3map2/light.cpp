@@ -774,7 +774,20 @@ float PointToPolygonFormFactor( const Vector3& point, const Vector3& normal, con
    determines the amount of light reaching a sample (luxel or vertex) from a given light
  */
 
+static int LightContributionToSampleInner( trace_t *trace );
+
 int LightContributionToSample( trace_t *trace ){
+	static const bool counted = DebugCounterEnabled( "sample" );
+	if ( counted ) {
+		const unsigned long long start = DebugCounterStart();
+		const int result = LightContributionToSampleInner( trace );
+		DebugCounterStop( start );
+		return result;
+	}
+	return LightContributionToSampleInner( trace );
+}
+
+static int LightContributionToSampleInner( trace_t *trace ){
 	float angle;
 	float add;
 	float dist;
@@ -2662,6 +2675,14 @@ int LightMain( Args& args ){
 		while ( args.takeArg( "-splitwork" ) ) {
 			threadsHelpWithJobs = true;
 			Sys_Printf( "Splitting large lightmaps' work across threads\n" );
+		}
+		while ( args.takeArg( "-embree" ) ) {
+#ifdef Q3MAP2_EMBREE
+			lightEmbree = true;
+			Sys_Printf( "Tracing rays with Intel Embree\n" );
+#else
+			Sys_Warning( "-embree: this q3map2 was built without Embree support, using the default ray tracer\n" );
+#endif
 		}
 
 		while ( args.takeArg( "-nocollapse" ) ) {

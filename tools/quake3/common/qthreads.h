@@ -41,3 +41,10 @@ void ParallelFor( int count, const std::function<void( int )>& fn );
 
 /* runs the process below normal priority; returns false if that failed */
 bool ThreadSetLowPriority();
+
+/* thread profiling (env Q3MAP2_DEBUG_THREADPROFILE): code can time one kind of work per thread;
+   each worker thread calls threadProfileFlush when it finishes, which should add its totals with
+   ThreadProfileAddCounter, and RunThreadsOnIndividual reports them next to its busy time */
+bool ThreadProfileEnabled();
+extern void ( *threadProfileFlush )();
+void ThreadProfileAddCounter( double seconds, long long calls );
