@@ -2100,6 +2100,7 @@ static void LightWorld( bool fastAllocate, bool bounceStore ){
 	lightsClusterCulled = 0;
 
 	Sys_Printf( "--- IlluminateRawLightmap ---\n" );
+	GpuPrepareLights();
 	RunThreadsOnIndividual( numRawLightmaps, true, IlluminateRawLightmap );
 	Sys_Printf( "%9d luxels illuminated\n", numLuxelsIlluminated );
 	DebugPhaseHash( "IlluminateRawLightmap" );
@@ -2177,6 +2178,7 @@ static void LightWorld( bool fastAllocate, bool bounceStore ){
 		lightsClusterCulled = 0;
 
 		Sys_Printf( "--- IlluminateRawLightmap ---\n" );
+		GpuPrepareLights();
 		RunThreadsOnIndividual( numRawLightmaps, true, IlluminateRawLightmap );
 		Sys_Printf( "%9d luxels illuminated\n", numLuxelsIlluminated );
 		Sys_Printf( "%9d vertexes illuminated\n", numVertsIlluminated );

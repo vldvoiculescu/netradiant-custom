@@ -101,6 +101,21 @@ struct GpuNode
 	int type, children[ 2 ], numItems;
 };
 
+/* the bsp tree, brushes and pvs, for clusters of points (World in the shader) */
+struct GpuWorld
+{
+	std::vector<int> nodes;                 /* planeNum, front, back, 0 */
+	std::vector<float> planes;              /* normal, dist */
+	std::vector<int> leafs;                 /* cluster, firstLeafBrush, numLeafBrushes, 0 */
+	std::vector<int> leafBrushes;
+	std::vector<int> brushes;               /* firstSide, numSides */
+	std::vector<int> sides;                 /* planeNum */
+	std::vector<uint32_t> opaque;           /* per brush, 1 = opaque */
+	std::vector<uint32_t> vis;              /* bspVisBytes */
+	bool hasVis;
+	int leafBytes;
+};
+
 struct GpuScene
 {
 	std::vector<float> vertices;            /* the enlarged triangles for the acceleration structure, 9 floats each */
@@ -111,7 +126,82 @@ struct GpuScene
 	std::vector<uint32_t> images;
 	int headNode, numBspNodes;
 	uint32_t skyFlag;                       /* C_SKY */
+	GpuWorld world;
 };
+
+/* -------------------------------------------------------------------------------
+   direct lighting of raw lightmaps on the GPU: IlluminateRawLightmap()'s light loop
+   ------------------------------------------------------------------------------- */
+
+/* light_t */
+struct GpuLight
+{
+	float origin[ 3 ];
+	int type;                               /* ELightType */
+	float normal[ 3 ];
+	float dist;
+	float color[ 3 ];
+	float photons;
+	float radiusByDist, fade, angleScale, extraDist;
+	float add, envelope, falloffTolerance;
+	uint32_t flags;                         /* LightFlags */
+	int cluster, skyIndex;
+	int windingOffset, windingCount;        /* area lights: points in the winding list */
+};
+
+/* settings of a lighting pass */
+struct GpuLightParams
+{
+	int lightSamples, searchBoxSize;
+	bool faster, lightAngleHL, oneSky, testOcclusion;
+	uint32_t rayFlags;                      /* GPU_RAY_NO_SURFACES */
+	float linearScale;
+};
+
+/* a luxel of a raw lightmap */
+struct GpuLuxel
+{
+	float origin[ 3 ];
+	int cluster;
+	float normal[ 3 ];
+	float pad;
+};
+
+/* a light of a lightmap job: its luxels are the area x0, y0, w, h (the region rect and one luxel around) */
+struct GpuJobLight
+{
+	int light, tmpOffset, ax0, ay0;
+	int aw, ah, rx0, ry0;                   /* rx, ry: the region rect, the luxels it may light */
+	int rx1, ry1, filterRadius, negative;
+	int tileOffset, tileCount;              /* the region's tiles (16x16 luxels) in GpuLightmapJob::tiles */
+	int pad[ 2 ];
+};
+
+struct GpuLightmapJob
+{
+	int sw, sh;
+	const GpuLuxel *luxels;
+	float *superLuxels;                     /* SuperLuxel: in, the ambient light; out, with the lights added */
+	const int *lightClusters;
+	int numLightClusters;
+	const int *surfaces;
+	int numSurfaces;
+	int recvShadows;
+	bool twoSided;
+	const GpuJobLight *lights;              /* tmpOffset is set by GpuIlluminateLightmap() */
+	int numLights;
+	const int *tiles;                       /* tile numbers: y * tilesW + x */
+	int tilesW;
+};
+
+void GpuSetLights( const std::vector<GpuLight>& lights, const std::vector<float>& windings, const GpuLightParams& params ); /* between passes */
+void GpuSetInfos( const std::vector<GpuInfo>& infos ); /* between passes: the trace infos changed (sky indexes) */
+void GpuRefreshTraceInfos(); /* light_trace.cpp: GpuSetInfos() with the current shader sky indexes */
+bool GpuIlluminateLightmap( const GpuLightmapJob& job ); /* thread safe; false: the CPU must do it */
+/* CPU and GPU light lightmaps side by side: true claims a GPU place for a lightmap of this much work
+   (luxels times lights), to give back with GpuEndLightmap(); false: the GPU is busy, the CPU lights it */
+bool GpuBeginLightmap( double work );
+void GpuEndLightmap();
 
 /* light_gpu.cpp */
 bool GpuSetup( const GpuScene& scene );     /* false: no usable GPU */

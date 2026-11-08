@@ -86,8 +86,10 @@ T VkStruct( VkStructureType type ){
 	X( vkCmdBindDescriptorSets ) \
 	X( vkCmdPushConstants ) \
 	X( vkCmdDispatch ) \
+	X( vkCmdDispatchIndirect ) \
 	X( vkCmdPipelineBarrier ) \
 	X( vkCmdCopyBuffer ) \
+	X( vkCmdFillBuffer ) \
 	X( vkCreateQueryPool ) \
 	X( vkDestroyQueryPool ) \
 	X( vkCmdResetQueryPool ) \
@@ -149,10 +151,37 @@ struct Constants
 	uint32_t debugMode;
 	uint32_t kernel;                            /* KERNEL_* in the shader */
 	VkDeviceAddress params;                     /* GatherParams */
+	VkDeviceAddress job;                        /* LightJob */
+	VkDeviceAddress world;                      /* WorldData */
 };
-static_assert( sizeof( Constants ) == 96 );
+static_assert( sizeof( Constants ) == 112 );
 
-enum { KERNEL_TRACE = 0, KERNEL_GATHER_RAYS = 1, KERNEL_GATHER_REDUCE = 2 };
+enum { KERNEL_TRACE = 0, KERNEL_GATHER_RAYS = 1, KERNEL_GATHER_REDUCE = 2, KERNEL_LIGHT_INITIAL = 3, KERNEL_LIGHT_ACCUMULATE = 5, KERNEL_LIGHT_MARK = 6, KERNEL_LIGHT_SUBSAMPLE = 7, KERNEL_LIGHT_WALK = 8, KERNEL_LIGHT_ARGS = 10 };
+
+/* World in the shader */
+struct WorldData
+{
+	VkDeviceAddress nodes, planes, leafs, leafBrushes, brushes, sides, opaque, vis;
+	int32_t hasVis, leafBytes, numOpaque, pad;
+};
+static_assert( sizeof( WorldData ) == 80 );
+
+/* Job in the shader */
+struct LightJob
+{
+	VkDeviceAddress luxels, tmp, sub, flags, outs, jobLights, lightClusters, lights, windings, counters, items, candidates, dispatchArgs;
+	int32_t sw, sh, numJobLights, numLightClusters;
+	int32_t recvShadows, numSurfaces, twoSided, testOcclusion;
+	int32_t lightSamples, searchBoxSize, faster, lightAngleHL;
+	int32_t oneSky, totalTmp, rayFlags, numItems;
+	float linearScale;
+	int32_t inlineBudget;
+	VkDeviceAddress diagonals;
+};
+static_assert( sizeof( LightJob ) == 184 );
+static_assert( sizeof( GpuLight ) == 96 );
+static_assert( sizeof( GpuLuxel ) == 32 );
+static_assert( sizeof( GpuJobLight ) == 64 );
 
 /* Params in the shader */
 struct GatherParams
@@ -179,9 +208,13 @@ struct Slot
 	VkCommandPool pool = VK_NULL_HANDLE;
 	VkCommandBuffer cmd = VK_NULL_HANDLE;
 	VkFence fence = VK_NULL_HANDLE;
+	uint32_t queue = 0;                         /* index in queues */
 	Buffer rays, hits, surfaces;
 	Buffer samples, vectors, params, outs;      /* gathers */
 	Buffer values;                              /* gathers: a value per ray, on the GPU */
+	Buffer staging, readback;                   /* lightmap jobs: uploads and results */
+	Buffer jobLuxels, jobOuts, jobClusters, jobSurfaces, jobLights, jobTmp, jobSub, jobFlags, jobParams, jobCounters; /* on the GPU */
+	Buffer jobItems, jobCandidates, jobArgs, jobDiagonals;
 	VkQueryPool timestamps = VK_NULL_HANDLE;   /* shader start and end */
 };
 
@@ -195,12 +228,21 @@ VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
 VkPhysicalDeviceMemoryProperties memoryProperties;
 VkDevice device = VK_NULL_HANDLE;
 uint32_t queueFamily = 0;
-VkQueue queue = VK_NULL_HANDLE;
-std::mutex queueMutex;
+/* several queues: a barrier waits for all the work submitted before it to its queue, so batches of
+   different threads on one queue would wait for each other */
+const uint32_t maxQueues = 8;
+VkQueue queues[ maxQueues ];
+std::mutex queueMutexes[ maxQueues ];
+uint32_t numQueues = 1;
 VkCommandPool setupPool = VK_NULL_HANDLE;
 VkDeviceSize scratchAlignment = 256;
 
 Buffer triangles, infos, nodes, paths, images, vertices, instances;
+Buffer worldNodes, worldPlanes, worldLeafs, worldLeafBrushes, worldBrushes, worldSides, worldOpaque, worldVis, worldData;
+Buffer lightTable, lightWindings;
+GpuLightParams lightParams;
+std::atomic<long long> statKernelNanoseconds[ 3 ];
+std::atomic<long long> statLightmaps, statLightmapFallbacks, statLightMicroseconds, statOverflowRays, statSolidOverflowRays, statUnpredictedStamps;
 Buffer blasBuffer, tlasBuffer;
 VkAccelerationStructureKHR blas = VK_NULL_HANDLE, tlas = VK_NULL_HANDLE;
 VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
@@ -313,13 +355,17 @@ long long RateDevice( VkPhysicalDevice physical, uint32_t& family, std::string& 
 	vkGetPhysicalDeviceQueueFamilyProperties( physical, &count, nullptr );
 	std::vector<VkQueueFamilyProperties> families( count );
 	vkGetPhysicalDeviceQueueFamilyProperties( physical, &count, families.data() );
+	/* the first compute queue family; env Q3MAP2_DEBUG_GPU_FAMILY picks another (debugging aid) */
 	family = count;
 	for ( uint32_t i = 0; i < count; ++i )
 	{
-		if ( families[ i ].queueFlags & VK_QUEUE_COMPUTE_BIT ) {
+		if ( ( families[ i ].queueFlags & VK_QUEUE_COMPUTE_BIT ) && family == count ) {
 			family = i;
-			break;
 		}
+	}
+	if ( const char *forced = getenv( "Q3MAP2_DEBUG_GPU_FAMILY" ); forced != nullptr && uint32_t( atoi( forced ) ) < count
+	  && ( families[ atoi( forced ) ].queueFlags & VK_QUEUE_COMPUTE_BIT ) ) {
+		family = atoi( forced );
 	}
 	if ( family == count ) {
 		why = "no compute queue";
@@ -403,7 +449,7 @@ void EnsureDeviceBuffer( Buffer& b, VkDeviceSize size ){
 	if ( b.size < size ) {
 		const VkDeviceSize grown = std::max( size, b.size * 2 );
 		DestroyBuffer( b );
-		b = CreateBuffer( grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+		b = CreateBuffer( grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
 	}
 }
 
@@ -411,7 +457,7 @@ void EnsureHostBuffer( Buffer& b, VkDeviceSize size, VkMemoryPropertyFlags prefe
 	if ( b.size < size ) {
 		const VkDeviceSize grown = std::max( size, b.size * 2 );
 		DestroyBuffer( b );
-		b = CreateBuffer( grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, preferred );
+		b = CreateBuffer( grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, preferred );
 	}
 }
 
@@ -437,8 +483,8 @@ void RunCommands( Record&& record ){
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &cmd;
 	{
-		std::lock_guard lock( queueMutex );
-		Check( vkQueueSubmit( queue, 1, &submit, fence ), "vkQueueSubmit" );
+		std::lock_guard lock( queueMutexes[ 0 ] );
+		Check( vkQueueSubmit( queues[ 0 ], 1, &submit, fence ), "vkQueueSubmit" );
 	}
 	Check( vkWaitForFences( device, 1, &fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
 	vkDestroyFence( device, fence, nullptr );
@@ -545,11 +591,20 @@ bool CreateDevice(){
 		timestampPeriod = properties.limits.timestampPeriod;
 	}
 
-	const float priority = 1;
+	uint32_t numFamilies = 0;
+	vkGetPhysicalDeviceQueueFamilyProperties( physicalDevice, &numFamilies, nullptr );
+	std::vector<VkQueueFamilyProperties> families( numFamilies );
+	vkGetPhysicalDeviceQueueFamilyProperties( physicalDevice, &numFamilies, families.data() );
+	numQueues = std::clamp( families[ queueFamily ].queueCount, 1u, maxQueues );
+	/* debugging aid: env Q3MAP2_DEBUG_GPU_QUEUES limits the number of queues */
+	if ( const char *forced = getenv( "Q3MAP2_DEBUG_GPU_QUEUES" ) ) {
+		numQueues = std::clamp( uint32_t( atoi( forced ) ), 1u, numQueues );
+	}
+	const float priorities[ maxQueues ] = { 1, 1, 1, 1, 1, 1, 1, 1 };
 	VkDeviceQueueCreateInfo queueInfo = VkStruct<VkDeviceQueueCreateInfo>( VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO );
 	queueInfo.queueFamilyIndex = queueFamily;
-	queueInfo.queueCount = 1;
-	queueInfo.pQueuePriorities = &priority;
+	queueInfo.queueCount = numQueues;
+	queueInfo.pQueuePriorities = priorities;
 
 	Features features; /* all off but these */
 	features.rayQuery.rayQuery = VK_TRUE;
@@ -567,13 +622,14 @@ bool CreateDevice(){
 		Sys_Warning( "-gpu: could not open %s\n", properties.deviceName );
 		return false;
 	}
-	vkGetDeviceQueue( device, queueFamily, 0, &queue );
+	for ( uint32_t i = 0; i < numQueues; ++i )
+		vkGetDeviceQueue( device, queueFamily, i, &queues[ i ] );
 
 	VkCommandPoolCreateInfo poolInfo = VkStruct<VkCommandPoolCreateInfo>( VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO );
 	poolInfo.queueFamilyIndex = queueFamily;
 	Check( vkCreateCommandPool( device, &poolInfo, nullptr, &setupPool ), "vkCreateCommandPool" );
 
-	Sys_Printf( "-gpu: tracing on %s\n", properties.deviceName );
+	Sys_Printf( "-gpu: tracing on %s (%u queues of family %u)\n", properties.deviceName, numQueues, queueFamily );
 	return true;
 }
 
@@ -659,11 +715,12 @@ Slot *AcquireSlot(){
 	if ( timestampPeriod != 0 ) {
 		VkQueryPoolCreateInfo queryInfo = VkStruct<VkQueryPoolCreateInfo>( VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO );
 		queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-		queryInfo.queryCount = 2;
+		queryInfo.queryCount = 5;
 		Check( vkCreateQueryPool( device, &queryInfo, nullptr, &slot->timestamps ), "vkCreateQueryPool" );
 	}
 
 	std::lock_guard lock( slotsMutex );
+	slot->queue = uint32_t( allSlots.size() % numQueues );
 	allSlots.push_back( std::move( slot ) );
 	return allSlots.back().get();
 }
@@ -728,6 +785,33 @@ bool GpuSetup( const GpuScene& scene ){
 
 	CreatePipeline();
 
+	/* the bsp tree, brushes and pvs */
+	{
+		const GpuWorld& w = scene.world;
+		worldNodes = Upload( w.nodes, storage );
+		worldPlanes = Upload( w.planes, storage );
+		worldLeafs = Upload( w.leafs, storage );
+		worldLeafBrushes = Upload( w.leafBrushes, storage );
+		worldBrushes = Upload( w.brushes, storage );
+		worldSides = Upload( w.sides, storage );
+		worldOpaque = Upload( w.opaque, storage );
+		worldVis = Upload( w.vis, storage );
+		WorldData data;
+		data.nodes = worldNodes.address;
+		data.planes = worldPlanes.address;
+		data.leafs = worldLeafs.address;
+		data.leafBrushes = worldLeafBrushes.address;
+		data.brushes = worldBrushes.address;
+		data.sides = worldSides.address;
+		data.opaque = worldOpaque.address;
+		data.vis = worldVis.address;
+		data.hasVis = w.hasVis;
+		data.leafBytes = w.leafBytes;
+		data.numOpaque = int32_t( w.opaque.size() );
+		data.pad = 0;
+		worldData = Upload( std::vector<WorldData>{ data }, storage );
+	}
+
 	sceneConstants = {};
 	sceneConstants.triangles = triangles.address;
 	sceneConstants.infos = infos.address;
@@ -737,6 +821,7 @@ bool GpuSetup( const GpuScene& scene ){
 	sceneConstants.headNode = scene.headNode;
 	sceneConstants.numBspNodes = scene.numBspNodes;
 	sceneConstants.skyFlag = scene.skyFlag;
+	sceneConstants.world = worldData.address;
 	/* debugging aid: env Q3MAP2_DEBUG_GPU_MODE skips parts of the shader's work (see light_gpu_trace.comp) */
 	if ( const char *mode = getenv( "Q3MAP2_DEBUG_GPU_MODE" ) ) {
 		sceneConstants.debugMode = uint32_t( atoi( mode ) );
@@ -761,7 +846,7 @@ void RunBatch( Slot *slot, Record&& record ){
 	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	Check( vkBeginCommandBuffer( slot->cmd, &begin ), "vkBeginCommandBuffer" );
 	if ( slot->timestamps != VK_NULL_HANDLE ) {
-		vkCmdResetQueryPool( slot->cmd, slot->timestamps, 0, 2 );
+		vkCmdResetQueryPool( slot->cmd, slot->timestamps, 0, 5 );
 		vkCmdWriteTimestamp( slot->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot->timestamps, 0 );
 	}
 	vkCmdBindPipeline( slot->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline );
@@ -780,8 +865,8 @@ void RunBatch( Slot *slot, Record&& record ){
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &slot->cmd;
 	{
-		std::lock_guard lock( queueMutex );
-		Check( vkQueueSubmit( queue, 1, &submit, slot->fence ), "vkQueueSubmit" );
+		std::lock_guard lock( queueMutexes[ slot->queue ] );
+		Check( vkQueueSubmit( queues[ slot->queue ], 1, &submit, slot->fence ), "vkQueueSubmit" );
 	}
 	Check( vkWaitForFences( device, 1, &slot->fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
 	Check( vkResetFences( device, 1, &slot->fence ), "vkResetFences" );
@@ -795,7 +880,7 @@ void RunBatch( Slot *slot, Record&& record ){
 
 void Dispatch( VkCommandBuffer cmd, const Constants& constants, size_t threads ){
 	vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
-	vkCmdDispatch( cmd, uint32_t( ( threads + 63 ) / 64 ), 1, 1 );
+	vkCmdDispatch( cmd, uint32_t( ( threads + 255 ) / 256 ), 1, 1 );
 }
 
 /* a dispatch's writes are seen by the next one */
@@ -917,19 +1002,401 @@ void GpuGather( const GpuGatherParams& params, const GpuGatherSample *samples, s
 	statMicroseconds += std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now() - start ).count();
 }
 
+void GpuSetInfos( const std::vector<GpuInfo>& newInfos ){
+	if ( device == VK_NULL_HANDLE ) {
+		return;
+	}
+	vkDeviceWaitIdle( device );
+	DestroyBuffer( infos );
+	infos = Upload( newInfos, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT );
+	sceneConstants.infos = infos.address;
+}
+
+void GpuSetLights( const std::vector<GpuLight>& lights, const std::vector<float>& windings, const GpuLightParams& params ){
+	if ( device == VK_NULL_HANDLE ) {
+		return;
+	}
+	vkDeviceWaitIdle( device );
+	DestroyBuffer( lightTable );
+	DestroyBuffer( lightWindings );
+	lightTable = Upload( lights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT );
+	lightWindings = Upload( windings, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT );
+	lightParams = params;
+}
+
+namespace
+{
+size_t Align16( size_t size ){
+	return ( size + 15 ) & ~size_t( 15 );
+}
+
+void Barrier( VkCommandBuffer cmd, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess, VkPipelineStageFlags dstStage, VkAccessFlags dstAccess ){
+	VkMemoryBarrier barrier = VkStruct<VkMemoryBarrier>( VK_STRUCTURE_TYPE_MEMORY_BARRIER );
+	barrier.srcAccessMask = srcAccess;
+	barrier.dstAccessMask = dstAccess;
+	vkCmdPipelineBarrier( cmd, srcStage, dstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr );
+}
+
+/* data copied to GPU buffers at the start of a batch */
+struct UploadItem
+{
+	Buffer *buffer;
+	const void *data;
+	size_t size;
+};
+
+void RecordUploads( Slot *slot, VkCommandBuffer cmd, std::initializer_list<UploadItem> items ){
+	size_t total = 0;
+	for ( const UploadItem& item : items )
+		total += Align16( item.size );
+	EnsureHostBuffer( slot->staging, std::max<size_t>( total, 16 ), VK_MEMORY_PROPERTY_HOST_COHERENT_BIT );
+	size_t offset = 0;
+	const auto start = std::chrono::steady_clock::now();
+	for ( const UploadItem& item : items )
+	{
+		if ( item.size == 0 ) {
+			continue;
+		}
+		memcpy( static_cast<char*>( slot->staging.mapped ) + offset, item.data, item.size );
+		const VkBufferCopy copy{ offset, 0, item.size };
+		vkCmdCopyBuffer( cmd, slot->staging.buffer, item.buffer->buffer, 1, &copy );
+		offset += Align16( item.size );
+	}
+	statCopyMicroseconds += std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now() - start ).count();
+	Barrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT );
+}
+
+/* luxels of per-light buffers in one batch */
+const size_t maxJobTmp = size_t( 1 ) << 21;
+/* supersampling rounds for the luxels the walk didn't predict (env Q3MAP2_DEBUG_GPU_ROUNDS) */
+const int subsampleRounds = getenv( "Q3MAP2_DEBUG_GPU_ROUNDS" ) != nullptr ? std::max( 1, atoi( getenv( "Q3MAP2_DEBUG_GPU_ROUNDS" ) ) ) : 64;
+std::atomic<long long> statPausedLights;
+/* luxels the walk of a light may subsample itself per round, one per stamp thread, before it pauses (env Q3MAP2_DEBUG_GPU_INLINE) */
+const int inlineBudget = getenv( "Q3MAP2_DEBUG_GPU_INLINE" ) != nullptr ? std::max( 0, atoi( getenv( "Q3MAP2_DEBUG_GPU_INLINE" ) ) ) : 4096;
+}
+
+bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
+	if ( lightTable.buffer == VK_NULL_HANDLE ) {
+		return false;
+	}
+	const auto start = std::chrono::steady_clock::now();
+	Slot *slot = AcquireSlot();
+	const size_t numLuxels = size_t( job.sw ) * job.sh;
+
+	EnsureDeviceBuffer( slot->jobLuxels, numLuxels * sizeof( GpuLuxel ) );
+	EnsureDeviceBuffer( slot->jobOuts, numLuxels * 16 );
+	EnsureDeviceBuffer( slot->jobClusters, std::max( job.numLightClusters, 1 ) * sizeof( int ) );
+	EnsureDeviceBuffer( slot->jobSurfaces, std::max( job.numSurfaces, 1 ) * sizeof( int ) );
+	EnsureDeviceBuffer( slot->jobParams, sizeof( LightJob ) );
+	EnsureDeviceBuffer( slot->jobCounters, 32 + size_t( job.numLights ) * 4 ); /* counters, then a resume diagonal per light */
+	if ( slot->jobArgs.buffer == VK_NULL_HANDLE ) {
+		slot->jobArgs = CreateBuffer( 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+	}
+	EnsureHostBuffer( slot->readback, numLuxels * 16 + 32, cachedMemory );
+
+	/* batches of lights, their per-light buffers within maxJobTmp luxels */
+	std::vector<GpuJobLight> lights( job.lights, job.lights + job.numLights );
+	bool first = true;
+	for ( size_t begin = 0; begin < lights.size(); )
+	{
+		size_t end = begin;
+		size_t totalTmp = 0;
+		while ( end < lights.size() && ( end == begin || totalTmp + size_t( lights[ end ].aw ) * lights[ end ].ah <= maxJobTmp ) )
+		{
+			lights[ end ].tmpOffset = int( totalTmp );
+			totalTmp += size_t( lights[ end ].aw ) * lights[ end ].ah;
+			++end;
+		}
+		/* a bit per stamp diagonal of each light (x + 2y in its area) */
+		size_t diagonalWords = 0;
+		for ( size_t l = begin; l < end; ++l )
+		{
+			lights[ l ].pad[ 0 ] = int( diagonalWords );
+			diagonalWords += ( size_t( lights[ l ].aw ) + 2 * size_t( lights[ l ].ah ) ) / 32 + 1;
+		}
+		const bool last = end == lights.size();
+		const int numJobLights = int( end - begin );
+
+		/* work items: the tiles of the lights' regions */
+		std::vector<int> items;
+		for ( size_t l = begin; l < end; ++l )
+		{
+			for ( int k = 0; k < lights[ l ].tileCount; ++k )
+			{
+				const int t = job.tiles[ lights[ l ].tileOffset + k ];
+				items.insert( items.end(), { int( l - begin ), t % job.tilesW, t / job.tilesW, 0 } );
+			}
+		}
+		const uint32_t numItems = uint32_t( items.size() / 4 );
+		EnsureDeviceBuffer( slot->jobItems, std::max<size_t>( items.size(), 4 ) * sizeof( int ) );
+		EnsureDeviceBuffer( slot->jobCandidates, std::max<size_t>( totalTmp, 1 ) * 8 );
+		EnsureDeviceBuffer( slot->jobDiagonals, diagonalWords * 4 );
+
+		EnsureDeviceBuffer( slot->jobLights, numJobLights * sizeof( GpuJobLight ) );
+		EnsureDeviceBuffer( slot->jobTmp, std::max<size_t>( totalTmp, 1 ) * 16 );
+		EnsureDeviceBuffer( slot->jobSub, std::max<size_t>( totalTmp, 1 ) * 16 );
+		EnsureDeviceBuffer( slot->jobFlags, std::max<size_t>( totalTmp, 1 ) * 4 );
+
+		LightJob params{};
+		params.luxels = slot->jobLuxels.address;
+		params.tmp = slot->jobTmp.address;
+		params.sub = slot->jobSub.address;
+		params.flags = slot->jobFlags.address;
+		params.outs = slot->jobOuts.address;
+		params.jobLights = slot->jobLights.address;
+		params.lightClusters = slot->jobClusters.address;
+		params.lights = lightTable.address;
+		params.windings = lightWindings.address;
+		params.counters = slot->jobCounters.address;
+		params.items = slot->jobItems.address;
+		params.candidates = slot->jobCandidates.address;
+		params.diagonals = slot->jobDiagonals.address;
+		params.dispatchArgs = slot->jobArgs.address;
+		params.numItems = int32_t( numItems );
+		params.sw = job.sw;
+		params.sh = job.sh;
+		params.numJobLights = numJobLights;
+		params.numLightClusters = job.numLightClusters;
+		params.recvShadows = job.recvShadows;
+		params.numSurfaces = job.numSurfaces;
+		params.twoSided = job.twoSided;
+		params.testOcclusion = lightParams.testOcclusion;
+		params.lightSamples = lightParams.lightSamples;
+		params.searchBoxSize = lightParams.searchBoxSize;
+		params.faster = lightParams.faster;
+		params.lightAngleHL = lightParams.lightAngleHL;
+		params.oneSky = lightParams.oneSky;
+		params.totalTmp = int32_t( totalTmp );
+		params.rayFlags = int32_t( lightParams.rayFlags );
+		params.linearScale = lightParams.linearScale;
+		params.inlineBudget = inlineBudget;
+
+		Constants constants = sceneConstants;
+		constants.surfaces = slot->jobSurfaces.address;
+		constants.job = slot->jobParams.address;
+
+		const VkPipelineStageFlags compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+		const VkAccessFlags readWrite = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+		const auto mark = [&]( VkCommandBuffer cmd, uint32_t query ){
+			if ( slot->timestamps != VK_NULL_HANDLE ) {
+				vkCmdWriteTimestamp( cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, slot->timestamps, query );
+			}
+		};
+		/* a supersampling round: subsample the candidates added since the last round, walk the lights on;
+		   a walk needing more luxels pauses its light (counters[ 7 ]) */
+		const auto recordRound = [&]( VkCommandBuffer cmd, bool lastRound ){
+			constants.kernel = KERNEL_LIGHT_ARGS;
+			constants.count = 0;
+			Dispatch( cmd, constants, 1 );
+			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, readWrite | VK_ACCESS_INDIRECT_COMMAND_READ_BIT );
+			constants.kernel = KERNEL_LIGHT_SUBSAMPLE;
+			vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
+			vkCmdDispatchIndirect( cmd, slot->jobArgs.buffer, 0 );
+			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
+			constants.kernel = KERNEL_LIGHT_WALK;
+			constants.count = lastRound ? 1 : 0;
+			vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
+			vkCmdDispatch( cmd, uint32_t( numJobLights ), 1, 1 );
+			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
+			constants.count = 0;
+		};
+		/* adds the lights to the luxels unless a walk paused, then the counters (and the luxels) for the host */
+		const auto recordFinish = [&]( VkCommandBuffer cmd ){
+			mark( cmd, 3 );
+			constants.kernel = KERNEL_LIGHT_ACCUMULATE;
+			Dispatch( cmd, constants, numLuxels );
+			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
+			mark( cmd, 4 );
+			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT );
+			const VkBufferCopy counters{ 0, 0, 32 };
+			vkCmdCopyBuffer( cmd, slot->jobCounters.buffer, slot->readback.buffer, 1, &counters );
+			if ( last ) {
+				const VkBufferCopy outs{ 0, 32, numLuxels * 16 };
+				vkCmdCopyBuffer( cmd, slot->jobOuts.buffer, slot->readback.buffer, 1, &outs );
+			}
+			Barrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
+		};
+		const bool supersample = lightParams.lightSamples > 1;
+		const auto timestamps = [&](){
+			if ( slot->timestamps != VK_NULL_HANDLE ) {
+				uint64_t ticks[ 5 ];
+				if ( vkGetQueryPoolResults( device, slot->timestamps, 0, 5, sizeof( ticks ), ticks, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT ) == VK_SUCCESS ) {
+					for ( int k = 0; k < 3; ++k )
+						statKernelNanoseconds[ k ] += (long long)( ( ticks[ 2 + k ] - ticks[ k == 0 ? 0 : 1 + k ] ) * double( timestampPeriod ) );
+				}
+			}
+		};
+
+		RunBatch( slot, [&]( VkCommandBuffer cmd ){
+			/* luxels without light, the candidates and the rounds' state */
+			vkCmdFillBuffer( cmd, slot->jobFlags.buffer, 0, std::max<size_t>( totalTmp, 1 ) * 4, 0 );
+			vkCmdFillBuffer( cmd, slot->jobDiagonals.buffer, 0, diagonalWords * 4, 0 );
+			if ( first ) {
+				vkCmdFillBuffer( cmd, slot->jobCounters.buffer, 0, VK_WHOLE_SIZE, 0 );
+			}
+			else{
+				/* keeping the fallback counters and the paused lights */
+				vkCmdFillBuffer( cmd, slot->jobCounters.buffer, 12, 12, 0 );
+				vkCmdFillBuffer( cmd, slot->jobCounters.buffer, 28, VK_WHOLE_SIZE, 0 );
+			}
+			if ( first ) {
+				RecordUploads( slot, cmd, {
+					{ &slot->jobLuxels, job.luxels, numLuxels * sizeof( GpuLuxel ) },
+					{ &slot->jobOuts, job.superLuxels, numLuxels * 16 },
+					{ &slot->jobClusters, job.lightClusters, job.numLightClusters * sizeof( int ) },
+					{ &slot->jobSurfaces, job.surfaces, job.numSurfaces * sizeof( int ) },
+					{ &slot->jobLights, lights.data() + begin, numJobLights * sizeof( GpuJobLight ) },
+					{ &slot->jobItems, items.data(), items.size() * sizeof( int ) },
+					{ &slot->jobParams, &params, sizeof( params ) },
+				} );
+			}
+			else{
+				RecordUploads( slot, cmd, {
+					{ &slot->jobLights, lights.data() + begin, numJobLights * sizeof( GpuJobLight ) },
+					{ &slot->jobItems, items.data(), items.size() * sizeof( int ) },
+					{ &slot->jobParams, &params, sizeof( params ) },
+				} );
+			}
+			/* a workgroup per work item */
+			const auto dispatchItems = [&]( uint32_t kernel ){
+				constants.kernel = kernel;
+				vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
+				const uint32_t x = std::min<uint32_t>( numItems, 65535 );
+				vkCmdDispatch( cmd, x, x == 0 ? 0 : ( numItems + x - 1 ) / x, 1 );
+			};
+			dispatchItems( KERNEL_LIGHT_INITIAL );
+			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
+			mark( cmd, 2 );
+			if ( supersample ) {
+				/* supersampling: mark the stamps, subsample their luxels ahead, then walk the stamps in order */
+				dispatchItems( KERNEL_LIGHT_MARK );
+				Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
+				recordRound( cmd, subsampleRounds == 1 );
+			}
+			recordFinish( cmd );
+		} );
+		timestamps();
+
+		/* paused lights: more rounds, only for the lightmaps needing them */
+		uint32_t counters[ 8 ];
+		ReadBuffer( slot->readback, counters, sizeof( counters ) );
+		for ( int round = 1; supersample && counters[ 7 ] != 0 && counters[ 2 ] == 0 && round < subsampleRounds; ++round )
+		{
+			RunBatch( slot, [&]( VkCommandBuffer cmd ){
+				vkCmdFillBuffer( cmd, slot->jobCounters.buffer, 28, 4, 0 );
+				Barrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, compute, readWrite );
+				mark( cmd, 2 );
+				recordRound( cmd, round == subsampleRounds - 1 );
+				recordFinish( cmd );
+			} );
+			timestamps();
+			ReadBuffer( slot->readback, counters, sizeof( counters ) );
+		}
+		first = false;
+		begin = end;
+		if ( counters[ 0 ] != 0 || counters[ 1 ] != 0 || counters[ 2 ] != 0 ) {
+			break; /* the CPU does the lightmap */
+		}
+	}
+
+	bool ok = true;
+	if ( job.numLights == 0 ) {
+		/* nothing to add */
+	}
+	else
+	{
+		uint32_t counters[ 8 ];
+		std::vector<char> result( numLuxels * 16 + 32 );
+		ReadBuffer( slot->readback, result.data(), result.size() );
+		memcpy( counters, result.data(), sizeof( counters ) );
+		statPausedLights += counters[ 6 ];
+		statOverflowRays += counters[ 0 ];
+		statSolidOverflowRays += counters[ 1 ];
+		statUnpredictedStamps += counters[ 2 ];
+		if ( counters[ 0 ] != 0 || counters[ 1 ] != 0 || counters[ 2 ] != 0 ) {
+			ok = false;
+			++statLightmapFallbacks;
+		}
+		else{
+			memcpy( job.superLuxels, result.data() + 32, numLuxels * 16 );
+		}
+	}
+	ReleaseSlot( slot );
+	++statLightmaps;
+	statLightMicroseconds += std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now() - start ).count();
+	return ok;
+}
+
+/* CPU and GPU light side by side: the GPU takes the big lightmaps (luxels times lights of at least
+   env Q3MAP2_DEBUG_GPU_MINWORK, 1e7), where it is many times faster; small ones are faster on the CPU.
+   env Q3MAP2_DEBUG_GPU_INFLIGHT limits the lightmaps on the GPU at once (0: no limit) */
+std::atomic<int> lightInFlight;
+std::atomic<long long> statCpuLightmaps;
+std::atomic<double> statCpuWork, statGpuWork;
+thread_local double gpuLightmapWork;
+thread_local std::chrono::steady_clock::time_point gpuLightmapStart;
+
+bool GpuBeginLightmap( double work ){
+	static const int limit = getenv( "Q3MAP2_DEBUG_GPU_INFLIGHT" ) != nullptr ? atoi( getenv( "Q3MAP2_DEBUG_GPU_INFLIGHT" ) ) : 0;
+	static const double minWork = getenv( "Q3MAP2_DEBUG_GPU_MINWORK" ) != nullptr ? atof( getenv( "Q3MAP2_DEBUG_GPU_MINWORK" ) ) : 1e7;
+	if ( work < minWork ) {
+		++statCpuLightmaps;
+		statCpuWork += work;
+		return false;
+	}
+	if ( limit > 0 ) {
+		int n = lightInFlight.load();
+		do
+		{
+			if ( n >= limit ) {
+				++statCpuLightmaps;
+				statCpuWork += work;
+				return false;
+			}
+		} while ( !lightInFlight.compare_exchange_weak( n, n + 1 ) );
+	}
+	statGpuWork += work;
+	gpuLightmapWork = work;
+	gpuLightmapStart = std::chrono::steady_clock::now();
+	return true;
+}
+
+void GpuEndLightmap(){
+	static const int limit = getenv( "Q3MAP2_DEBUG_GPU_INFLIGHT" ) != nullptr ? atoi( getenv( "Q3MAP2_DEBUG_GPU_INFLIGHT" ) ) : 0;
+	if ( limit > 0 ) {
+		--lightInFlight;
+	}
+	/* debugging aid: env Q3MAP2_DEBUG_GPU_SLOW=<seconds> logs the slower GPU lightmaps */
+	static const double slow = getenv( "Q3MAP2_DEBUG_GPU_SLOW" ) != nullptr ? atof( getenv( "Q3MAP2_DEBUG_GPU_SLOW" ) ) : 0;
+	if ( slow > 0 ) {
+		const double s = std::chrono::duration<double>( std::chrono::steady_clock::now() - gpuLightmapStart ).count();
+		if ( s >= slow ) {
+			fprintf( stderr, "gpu lightmap: %.3f s, work %.0f\n", s, gpuLightmapWork );
+		}
+	}
+}
+
 void GpuShutdown(){
 	if ( device == VK_NULL_HANDLE ) {
 		return;
 	}
+	Sys_Printf( "%9lld lightmaps lit on the CPU while the GPU was busy (work: CPU %.3g, GPU %.3g luxel lights)\n", statCpuLightmaps.load(), statCpuWork.load(), statGpuWork.load() );
 	Sys_Printf( "%9lld GPU rays in %lld batches: %.2f s in the shader, %.1f s in batches and %.1f s copying rays and hits (summed over threads)\n",
 	            statRays.load(), statBatches.load(), statShaderNanoseconds.load() * 1e-9, statMicroseconds.load() * 1e-6, statCopyMicroseconds.load() * 1e-6 );
+	Sys_Printf( "%9s light kernels: initial %.2f s, supersample %.2f s, accumulate %.2f s (summed over jobs)\n", "",
+	            statKernelNanoseconds[ 0 ].load() * 1e-9, statKernelNanoseconds[ 1 ].load() * 1e-9, statKernelNanoseconds[ 2 ].load() * 1e-9 );
+	Sys_Printf( "%9lld lightmaps lit on the GPU (%.1f s summed over threads), %lld redone on the CPU (rays with too many surfaces %lld, too deep in the bsp %lld, lights with too many unpredicted subsamples %lld)\n",
+	            statLightmaps.load(), statLightMicroseconds.load() * 1e-6, statLightmapFallbacks.load(), statOverflowRays.load(), statSolidOverflowRays.load(), statUnpredictedStamps.load() );
+	Sys_Printf( "%9lld light walks paused for another subsampling round (%d rounds)\n", statPausedLights.load(), subsampleRounds );
 	vkDeviceWaitIdle( device );
 	for ( auto& slot : allSlots )
 	{
 		DestroyBuffer( slot->rays );
 		DestroyBuffer( slot->hits );
 		DestroyBuffer( slot->surfaces );
-		for ( Buffer *b : { &slot->samples, &slot->vectors, &slot->params, &slot->outs, &slot->values } )
+		for ( Buffer *b : { &slot->samples, &slot->vectors, &slot->params, &slot->outs, &slot->values, &slot->staging, &slot->readback,
+		                    &slot->jobLuxels, &slot->jobOuts, &slot->jobClusters, &slot->jobSurfaces, &slot->jobLights, &slot->jobTmp, &slot->jobSub, &slot->jobFlags,
+		                    &slot->jobParams, &slot->jobCounters, &slot->jobItems, &slot->jobCandidates, &slot->jobArgs, &slot->jobDiagonals } )
 			DestroyBuffer( *b );
 		vkDestroyFence( device, slot->fence, nullptr );
 		if ( slot->timestamps != VK_NULL_HANDLE ) {
@@ -945,7 +1412,9 @@ void GpuShutdown(){
 	vkDestroyDescriptorSetLayout( device, setLayout, nullptr );
 	vkDestroyAccelerationStructureKHR( device, tlas, nullptr );
 	vkDestroyAccelerationStructureKHR( device, blas, nullptr );
-	for ( Buffer *b : { &triangles, &infos, &nodes, &paths, &images, &vertices, &instances, &blasBuffer, &tlasBuffer } )
+	for ( Buffer *b : { &triangles, &infos, &nodes, &paths, &images, &vertices, &instances, &blasBuffer, &tlasBuffer,
+	                    &worldNodes, &worldPlanes, &worldLeafs, &worldLeafBrushes, &worldBrushes, &worldSides, &worldOpaque, &worldVis, &worldData,
+	                    &lightTable, &lightWindings } )
 		DestroyBuffer( *b );
 	vkDestroyCommandPool( device, setupPool, nullptr );
 	vkDestroyDevice( device, nullptr );
@@ -963,6 +1432,18 @@ bool GpuSetup( const GpuScene& ){
 void GpuTrace( const GpuRay *, GpuHit *, size_t, const int *, size_t ){
 }
 void GpuGather( const GpuGatherParams&, const GpuGatherSample *, size_t, GpuGatherOut * ){
+}
+void GpuSetLights( const std::vector<GpuLight>&, const std::vector<float>&, const GpuLightParams& ){
+}
+void GpuSetInfos( const std::vector<GpuInfo>& ){
+}
+bool GpuIlluminateLightmap( const GpuLightmapJob& ){
+	return false;
+}
+bool GpuBeginLightmap( double ){
+	return false;
+}
+void GpuEndLightmap(){
 }
 void GpuShutdown(){
 }

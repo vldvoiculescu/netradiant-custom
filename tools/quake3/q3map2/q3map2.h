@@ -1821,6 +1821,7 @@ void                        MapRawLightmap( int num );
 
 void                        SetupDirt();
 void                        DirtyRawLightmap( int num );
+void                        GpuPrepareLights();
 
 void                        SetupFloodLight();
 void                        FloodlightRawLightmaps();

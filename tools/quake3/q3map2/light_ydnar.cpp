@@ -35,6 +35,7 @@
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <unordered_map>
 
 
 // http://www.graficaobscura.com/matrix/index.html
@@ -2820,6 +2821,374 @@ static int LightmapNumForLightStyle( const rawLightmap_t *lm, const light_t *lig
 
 
 
+/*
+   IlluminateRawLightmapLights()
+   adds the lights of a raw lightmap's light list (trace.lights) to its luxels, on the CPU
+ */
+
+static void IlluminateRawLightmapLights( int rawLightmapNum, rawLightmap_t *lm, rawLightmap_t& tmplm, trace_t& trace, size_t llSize, size_t ldSize ){
+	int lightmapNum, size;
+
+	Timer splitTimer;
+
+	/* -lightcull: tiles of luxels, to limit each light to the ones it may reach (not with random sample positions) */
+	const bool cull = lightCull && !lightRandomSamples;
+	LightTiles lightTiles;
+	if ( cull ) {
+		SetupLightTiles( lm, lightTiles );
+	}
+
+	/* walk light list */
+	/* -splitwork: with enough lights, compute a large lightmap's lights in parallel batches and
+	   accumulate them in light order. each light in a batch needs its own buffers; their total across
+	   all lightmaps being split at the same time is kept within a memory budget. lightmaps with few
+	   lights, or that don't fit the budget, split each light's luxels over threads instead */
+	const bool splitWork = threadsHelpWithJobs && size_t( lm->sw ) * lm->sh * trace.numLights >= splitWorkMinLuxelLights;
+	const bool splitRows = splitWork && size_t( lm->sw ) * lm->sh >= splitWorkMinRowLuxels;
+	const size_t flagsSize = lm->sw * lm->sh * sizeof( *lm->superFlags );
+	const size_t slotSize = llSize + ( deluxemap ? ldSize : 0 ) + flagsSize;
+	int numSlots = 0;
+	/* per-light buffers for a whole batch must be a small part of the budget, so that many lightmaps
+	   can be split at once; larger lightmaps split their luxels instead, which needs no extra memory */
+	if ( splitWork && trace.numLights >= numthreads && slotSize * numthreads * 2 <= splitWorkMemoryBudget / 8 ) {
+		const int wanted = std::min( numthreads * 2, trace.numLights );
+		size_t inUse = splitWorkMemoryInUse.load();
+		do{
+			numSlots = std::min( size_t( wanted ), ( splitWorkMemoryBudget - std::min( inUse, splitWorkMemoryBudget ) ) / slotSize );
+		} while ( numSlots >= 2 && !splitWorkMemoryInUse.compare_exchange_weak( inUse, inUse + numSlots * slotSize ) );
+	}
+	if ( numSlots >= 2 ) {
+		std::vector<rawLightmap_t> slots( numSlots, tmplm );
+		for ( rawLightmap_t& slot : slots )
+		{
+			slot.superLuxels[0] = safe_malloc( llSize );
+			slot.superDeluxels = deluxemap ? safe_malloc( ldSize ) : nullptr;
+			slot.superFlags = safe_malloc( flagsSize );
+		}
+		std::vector<int> lit( numSlots );
+		std::vector<LuxelRect> slotDirty( numSlots, LuxelRect{ 0, 0, lm->sw, lm->sh } );
+
+		for ( int base = 0; base < trace.numLights; base += numSlots )
+		{
+			const int count = std::min( numSlots, trace.numLights - base );
+			ParallelFor( count, [&]( int j ){
+				trace_t lightTrace = trace;
+				lightTrace.light = trace.lights[ base + j ];
+				if ( cull ) {
+					LightRegion region;
+					LightRegionFor( lightTiles, lm, lightTrace.light, region );
+					lit[ j ] = IlluminateRawLightmapLight( lm, slots[ j ], lightTrace, false, &region, &lightTiles, &slotDirty[ j ] );
+				}
+				else{
+					lit[ j ] = IlluminateRawLightmapLight( lm, slots[ j ], lightTrace, false );
+				}
+			} );
+			for ( int j = 0; j < count; ++j )
+			{
+				const light_t *light = trace.lights[ base + j ];
+				const int lightmapNum = LightmapNumForLightStyle( lm, light );
+				if ( lightmapNum >= 0 && lit[ j ] != 0 ) {
+					AccumulateRawLightmapLight( lm, slots[ j ], light, lightmapNum, false, cull ? &slotDirty[ j ] : nullptr );
+				}
+			}
+		}
+
+		for ( rawLightmap_t& slot : slots )
+		{
+			free( slot.superLuxels[0] );
+			free( slot.superDeluxels );
+			free( slot.superFlags );
+		}
+		splitWorkMemoryInUse -= numSlots * slotSize;
+	}
+	else
+	{
+		LuxelRect tmplmDirty{ 0, 0, lm->sw, lm->sh };
+		LightRegion region;
+		for ( int i = 0; i < trace.numLights; ++i )
+		{
+			/* setup trace */
+			trace.light = trace.lights[ i ];
+
+			/* style check */
+			lightmapNum = LightmapNumForLightStyle( lm, trace.light );
+			if ( lightmapNum < 0 ) {
+				continue;
+			}
+
+			/* allocate sampling flags storage */
+			if ( lightSamples > 1 || lightRandomSamples ) {
+				size = lm->sw * lm->sh * sizeof( *lm->superFlags );
+				if ( lm->superFlags == nullptr ) {
+					lm->superFlags = safe_malloc( size );
+				}
+				tmplm.superFlags = lm->superFlags;
+			}
+
+			/* compute this light's contribution, then add it */
+			if ( cull ) {
+				LightRegionFor( lightTiles, lm, trace.light, region );
+				if ( IlluminateRawLightmapLight( lm, tmplm, trace, splitRows, &region, &lightTiles, &tmplmDirty ) != 0 ) {
+					AccumulateRawLightmapLight( lm, tmplm, trace.light, lightmapNum, splitRows, &tmplmDirty );
+				}
+			}
+			else if ( IlluminateRawLightmapLight( lm, tmplm, trace, splitRows ) != 0 ) {
+				AccumulateRawLightmapLight( lm, tmplm, trace.light, lightmapNum, splitRows );
+			}
+		}
+	}
+
+	/* debugging aid for -splitwork: env Q3MAP2_DEBUG_SPLIT reports slow lightmaps */
+	if ( static const bool debugSplit = getenv( "Q3MAP2_DEBUG_SPLIT" ) != nullptr; debugSplit && splitTimer.elapsed_sec() > 2 ) {
+		fprintf( stderr, "split lm %d %dx%d lights %d mode %s slots %d: %.1f s\n", rawLightmapNum, lm->sw, lm->sh, trace.numLights,
+		         numSlots >= 2 ? "lights" : splitRows ? "rows" : "none", numSlots, splitTimer.elapsed_sec() );
+	}
+}
+
+/* -------------------------------------------------------------------------------
+
+   -gpu: the light loop of IlluminateRawLightmap() on the GPU (light_gpu.cpp, light_gpu_trace.comp)
+
+   ------------------------------------------------------------------------------- */
+
+namespace
+{
+/* the GPU light table of the current lighting pass */
+std::unordered_map<const light_t*, int> gpuLightIndexes;
+bool gpuLighting = false;
+}
+
+/*
+   GpuPrepareLights()
+   uploads the lights of a lighting pass (direct, then each bounce) before IlluminateRawLightmap()
+ */
+
+void GpuPrepareLights(){
+	gpuLightIndexes.clear();
+	gpuLighting = false;
+	if ( !GpuTraceEnabled() ) {
+		return;
+	}
+	GpuRefreshTraceInfos();
+	if ( getenv( "Q3MAP2_DEBUG_GPU_NOLIGHT" ) != nullptr ) {
+		return;
+	}
+
+	std::vector<GpuLight> table;
+	std::vector<float> windings;
+	for ( const light_t& light : lights )
+	{
+		GpuLight g{};
+		for ( int i = 0; i < 3; ++i )
+		{
+			g.origin[ i ] = light.origin[ i ];
+			g.normal[ i ] = light.normal[ i ];
+			g.color[ i ] = light.color[ i ];
+		}
+		g.type = int( light.type );
+		g.dist = light.dist;
+		g.photons = light.photons;
+		g.radiusByDist = light.radiusByDist;
+		g.fade = light.fade;
+		g.angleScale = light.angleScale;
+		g.extraDist = light.extraDist;
+		g.add = light.add;
+		g.envelope = light.envelope;
+		g.falloffTolerance = light.falloffTolerance;
+		g.flags = static_cast<std::uint32_t>( light.flags );
+		g.cluster = light.cluster;
+		g.skyIndex = light.skyIndex;
+		g.windingOffset = int( windings.size() / 4 );
+		g.windingCount = light.type == ELightType::Area ? int( light.w.size() ) : 0;
+		if ( light.type == ELightType::Area ) {
+			for ( const Vector3& point : light.w )
+				windings.insert( windings.end(), { point[ 0 ], point[ 1 ], point[ 2 ], 0 } );
+		}
+		gpuLightIndexes.emplace( &light, int( table.size() ) );
+		table.push_back( g );
+	}
+	if ( windings.empty() ) {
+		windings.resize( 4, 0 );
+	}
+
+	GpuLightParams params;
+	params.lightSamples = lightSamples;
+	params.searchBoxSize = lightSamplesSearchBoxSize;
+	params.faster = faster;
+	params.lightAngleHL = lightAngleHL;
+	params.oneSky = g_oneSky;
+	params.testOcclusion = !noTrace;
+	params.rayFlags = noSurfaces ? GPU_RAY_NO_SURFACES : 0;
+	params.linearScale = linearScale;
+	GpuSetLights( table, windings, params );
+	gpuLighting = true;
+}
+
+/*
+   GpuIlluminateRawLightmap()
+   IlluminateRawLightmapLights() on the GPU; false: the lightmap needs something the GPU doesn't do
+ */
+
+static bool GpuIlluminateRawLightmap( rawLightmap_t *lm, const trace_t& trace, bool hybrid = false ){
+	if ( !gpuLighting || deluxemap || lightRandomSamples || lightSamples > 4 ) {
+		return false;
+	}
+
+	/* all lights must go to the main lightmap, in the GPU light table */
+	std::vector<int> indexes;
+	for ( int i = 0; i < trace.numLights; ++i )
+	{
+		const light_t *light = trace.lights[ i ];
+		if ( LightmapNumForLightStyle( lm, light ) != 0 ) {
+			return false;
+		}
+		const auto found = gpuLightIndexes.find( light );
+		if ( found == gpuLightIndexes.end() ) {
+			return false;
+		}
+		indexes.push_back( found->second );
+	}
+
+	/* luxels */
+	std::vector<GpuLuxel> luxels( size_t( lm->sw ) * lm->sh );
+	for ( int y = 0; y < lm->sh; ++y )
+	{
+		for ( int x = 0; x < lm->sw; ++x )
+		{
+			GpuLuxel& luxel = luxels[ size_t( y ) * lm->sw + x ];
+			const Vector3& origin = lm->getSuperOrigin( x, y );
+			const Vector3& normal = lm->getSuperNormal( x, y );
+			for ( int i = 0; i < 3; ++i )
+			{
+				luxel.origin[ i ] = origin[ i ];
+				luxel.normal[ i ] = normal[ i ];
+			}
+			luxel.cluster = lm->getSuperCluster( x, y );
+			luxel.pad = 0;
+		}
+	}
+
+	/* each light's luxels: its -lightcull region (exact: no light reaches the others) and one luxel around */
+	LightTiles tiles;
+	SetupLightTiles( lm, tiles );
+	std::vector<GpuJobLight> jobLights;
+	std::vector<int> jobTiles;
+	LightRegion region;
+	for ( int i = 0; i < trace.numLights; ++i )
+	{
+		const light_t *light = trace.lights[ i ];
+		LightRegionFor( tiles, lm, light, region );
+		if ( region.tiles.empty() ) {
+			continue;
+		}
+		GpuJobLight& jl = jobLights.emplace_back();
+		jl.light = indexes[ i ];
+		jl.tmpOffset = 0;
+		jl.ax0 = std::max( 0, region.rect.x0 - 1 );
+		jl.ay0 = std::max( 0, region.rect.y0 - 1 );
+		jl.aw = std::min( lm->sw, region.rect.x1 + 1 ) - jl.ax0;
+		jl.ah = std::min( lm->sh, region.rect.y1 + 1 ) - jl.ay0;
+		jl.rx0 = region.rect.x0;
+		jl.ry0 = region.rect.y0;
+		jl.rx1 = region.rect.x1;
+		jl.ry1 = region.rect.y1;
+
+		/* AccumulateRawLightmapLight() */
+		const float filterRadius = std::max( { 0.f, lm->filterRadius, light->filterRadius } );
+		int luxelFilterRadius = lm->sampleSize != 0 ? superSample * filterRadius / lm->sampleSize : 0;
+		if ( luxelFilterRadius == 0 && ( filterRadius > 0 || filter ) ) {
+			luxelFilterRadius = 1;
+		}
+		jl.filterRadius = luxelFilterRadius;
+		jl.negative = ( light->flags & LightFlags::Negative ) ? 1 : 0;
+		jl.tileOffset = int( jobTiles.size() );
+		jl.tileCount = int( region.tiles.size() );
+		jl.pad[ 0 ] = jl.pad[ 1 ] = 0;
+		jobTiles.insert( jobTiles.end(), region.tiles.begin(), region.tiles.end() );
+
+		/* debugging aid: env Q3MAP2_DEBUG_GPU_CHECK also reports the luxels per light area against the region's */
+		if ( static const bool check = getenv( "Q3MAP2_DEBUG_GPU_CHECK" ) != nullptr; check ) {
+			static std::atomic<long long> areaLuxels, regionLuxels;
+			static const struct Report { ~Report(){ fprintf( stderr, "gpu light areas: %lld luxels, regions %lld\n", areaLuxels.load(), regionLuxels.load() ); } } report;
+			areaLuxels += jl.aw * jl.ah;
+			for ( int t : region.tiles )
+				regionLuxels += tiles.mapped[ t ];
+		}
+	}
+
+	GpuLightmapJob job;
+	job.sw = lm->sw;
+	job.sh = lm->sh;
+	job.luxels = luxels.data();
+	job.superLuxels = reinterpret_cast<float*>( lm->superLuxels[ 0 ] );
+	job.lightClusters = lm->lightClusters;
+	job.numLightClusters = lm->numLightClusters;
+	job.surfaces = trace.surfaces;
+	job.numSurfaces = trace.numSurfaces;
+	job.recvShadows = trace.recvShadows;
+	job.twoSided = trace.twoSided;
+	job.lights = jobLights.data();
+	job.numLights = int( jobLights.size() );
+	job.tiles = jobTiles.data();
+	job.tilesW = tiles.tilesW;
+	static_assert( sizeof( SuperLuxel ) == 16 );
+
+	/* CPU and GPU side by side: a busy GPU leaves the lightmap to this thread */
+	if ( hybrid ) {
+		double work = 0;
+		for ( const GpuJobLight& jl : jobLights )
+			work += double( jl.aw ) * jl.ah;
+		if ( !GpuBeginLightmap( work ) ) {
+			return false;
+		}
+		const bool ok = GpuIlluminateLightmap( job );
+		GpuEndLightmap();
+		return ok;
+	}
+	return GpuIlluminateLightmap( job );
+}
+
+/* debugging aid: env Q3MAP2_DEBUG_GPU_CHECK compares the GPU's luxels with the CPU's, printed at exit */
+static void GpuLightingCheck( int rawLightmapNum, const rawLightmap_t *lm, const trace_t& trace, const std::vector<SuperLuxel>& gpu ){
+	static std::atomic<long long> luxels, differ, differBig;
+	static std::atomic<int> printed;
+	static std::mutex mutex;
+	static float maxDifference = 0;
+	static const struct Report {
+		~Report(){
+			fprintf( stderr, "gpu lighting check: %lld luxels, %lld differ, %lld by more than 1, max %g\n", luxels.load(), differ.load(), differBig.load(), maxDifference );
+		}
+	} report;
+	for ( int y = 0; y < lm->sh; ++y )
+	{
+		for ( int x = 0; x < lm->sw; ++x )
+		{
+			if ( lm->getSuperCluster( x, y ) < CLUSTER_NORMAL ) {
+				continue;
+			}
+			const SuperLuxel& c = lm->getSuperLuxel( 0, x, y );
+			const SuperLuxel& g = gpu[ size_t( y ) * lm->sw + x ];
+			++luxels;
+			const float d = std::max( { std::fabs( c.value[ 0 ] - g.value[ 0 ] ), std::fabs( c.value[ 1 ] - g.value[ 1 ] ), std::fabs( c.value[ 2 ] - g.value[ 2 ] ), std::fabs( c.count - g.count ) } );
+			if ( d == 0 ) {
+				continue;
+			}
+			++differ;
+			if ( d > 1 ) {
+				++differBig;
+				if ( printed++ < 20 ) {
+					fprintf( stderr, "gpu lighting check lm %d %dx%d lights %d luxel %d %d: cpu ( %g %g %g ) %g gpu ( %g %g %g ) %g\n", rawLightmapNum, lm->sw, lm->sh, trace.numLights, x, y,
+					         c.value[ 0 ], c.value[ 1 ], c.value[ 2 ], c.count, g.value[ 0 ], g.value[ 1 ], g.value[ 2 ], g.count );
+				}
+			}
+			std::lock_guard lock( mutex );
+			value_maximize( maxDifference, d );
+		}
+	}
+}
+
+
+
 void IlluminateRawLightmap( int rawLightmapNum ){
 	int x, y, sx, sy, size, lightmapNum;
 	rawLightmap_t       *lm;
@@ -2987,119 +3356,86 @@ void IlluminateRawLightmap( int rawLightmapNum ){
 		//%	if( trace.numLights <= 0 )
 		//%		Sys_Printf( "Lightmap %9d: 0 lights, axis: %.2f, %.2f, %.2f\n", rawLightmapNum, lm->axis[ 0 ], lm->axis[ 1 ], lm->axis[ 2 ] );
 
-		Timer splitTimer;
-
-		/* -lightcull: tiles of luxels, to limit each light to the ones it may reach (not with random sample positions) */
-		const bool cull = lightCull && !lightRandomSamples;
-		LightTiles lightTiles;
-		if ( cull ) {
-			SetupLightTiles( lm, lightTiles );
-		}
-
-		/* walk light list */
-		/* -splitwork: with enough lights, compute a large lightmap's lights in parallel batches and
-		   accumulate them in light order. each light in a batch needs its own buffers; their total across
-		   all lightmaps being split at the same time is kept within a memory budget. lightmaps with few
-		   lights, or that don't fit the budget, split each light's luxels over threads instead */
-		const bool splitWork = threadsHelpWithJobs && size_t( lm->sw ) * lm->sh * trace.numLights >= splitWorkMinLuxelLights;
-		const bool splitRows = splitWork && size_t( lm->sw ) * lm->sh >= splitWorkMinRowLuxels;
-		const size_t flagsSize = lm->sw * lm->sh * sizeof( *lm->superFlags );
-		const size_t slotSize = llSize + ( deluxemap ? ldSize : 0 ) + flagsSize;
-		int numSlots = 0;
-		/* per-light buffers for a whole batch must be a small part of the budget, so that many lightmaps
-		   can be split at once; larger lightmaps split their luxels instead, which needs no extra memory */
-		if ( splitWork && trace.numLights >= numthreads && slotSize * numthreads * 2 <= splitWorkMemoryBudget / 8 ) {
-			const int wanted = std::min( numthreads * 2, trace.numLights );
-			size_t inUse = splitWorkMemoryInUse.load();
-			do{
-				numSlots = std::min( size_t( wanted ), ( splitWorkMemoryBudget - std::min( inUse, splitWorkMemoryBudget ) ) / slotSize );
-			} while ( numSlots >= 2 && !splitWorkMemoryInUse.compare_exchange_weak( inUse, inUse + numSlots * slotSize ) );
-		}
-		if ( numSlots >= 2 ) {
-			std::vector<rawLightmap_t> slots( numSlots, tmplm );
-			for ( rawLightmap_t& slot : slots )
-			{
-				slot.superLuxels[0] = safe_malloc( llSize );
-				slot.superDeluxels = deluxemap ? safe_malloc( ldSize ) : nullptr;
-				slot.superFlags = safe_malloc( flagsSize );
+		/* -gpu: the GPU lights the luxels, unless the lightmap needs something it doesn't do */
+		if ( static const bool check = getenv( "Q3MAP2_DEBUG_GPU_CHECK" ) != nullptr; check && gpuLighting ) {
+			/* debugging aid: light on both, keep the CPU's result, report differences */
+			const size_t count = size_t( lm->sw ) * lm->sh;
+			std::vector<SuperLuxel> start( lm->superLuxels[ 0 ], lm->superLuxels[ 0 ] + count );
+			const bool gpu = GpuIlluminateRawLightmap( lm, trace );
+			std::vector<SuperLuxel> gpuLuxels( lm->superLuxels[ 0 ], lm->superLuxels[ 0 ] + count );
+			std::copy( start.begin(), start.end(), lm->superLuxels[ 0 ] );
+			IlluminateRawLightmapLights( rawLightmapNum, lm, tmplm, trace, llSize, ldSize );
+			if ( gpu ) {
+				GpuLightingCheck( rawLightmapNum, lm, trace, gpuLuxels );
 			}
-			std::vector<int> lit( numSlots );
-			std::vector<LuxelRect> slotDirty( numSlots, LuxelRect{ 0, 0, lm->sw, lm->sh } );
-
-			for ( int base = 0; base < trace.numLights; base += numSlots )
-			{
-				const int count = std::min( numSlots, trace.numLights - base );
-				ParallelFor( count, [&]( int j ){
-					trace_t lightTrace = trace;
-					lightTrace.light = trace.lights[ base + j ];
-					if ( cull ) {
-						LightRegion region;
-						LightRegionFor( lightTiles, lm, lightTrace.light, region );
-						lit[ j ] = IlluminateRawLightmapLight( lm, slots[ j ], lightTrace, false, &region, &lightTiles, &slotDirty[ j ] );
-					}
-					else{
-						lit[ j ] = IlluminateRawLightmapLight( lm, slots[ j ], lightTrace, false );
-					}
-				} );
-				for ( int j = 0; j < count; ++j )
+			/* env Q3MAP2_DEBUG_GPU_LIGHT=<raw lightmap>: compares that lightmap light by light */
+			if ( const char *only = getenv( "Q3MAP2_DEBUG_GPU_LIGHT" ); only != nullptr && atoi( only ) == rawLightmapNum ) {
+				const std::vector<SuperLuxel> keep( lm->superLuxels[ 0 ], lm->superLuxels[ 0 ] + count );
+				const auto zero = [&](){
+					for ( size_t k = 0; k < count; ++k )
+						lm->superLuxels[ 0 ][ k ] = SuperLuxel{ Vector3( 0 ), start[ k ].count };
+				};
+				for ( int i = 0; i < trace.numLights; ++i )
 				{
-					const light_t *light = trace.lights[ base + j ];
-					const int lightmapNum = LightmapNumForLightStyle( lm, light );
-					if ( lightmapNum >= 0 && lit[ j ] != 0 ) {
-						AccumulateRawLightmapLight( lm, slots[ j ], light, lightmapNum, false, cull ? &slotDirty[ j ] : nullptr );
+					trace_t one = trace;
+					one.numLights = 1;
+					one.lights = &trace.lights[ i ];
+					zero();
+					const bool ok = GpuIlluminateRawLightmap( lm, one );
+					const std::vector<SuperLuxel> g( lm->superLuxels[ 0 ], lm->superLuxels[ 0 ] + count );
+					zero();
+					IlluminateRawLightmapLights( rawLightmapNum, lm, tmplm, one, llSize, ldSize );
+					float maxDiff = 0;
+					double sumCpu = 0, sumGpu = 0;
+					for ( size_t k = 0; k < count; ++k )
+					{
+						for ( int c = 0; c < 3; ++c )
+						{
+							value_maximize( maxDiff, std::fabs( lm->superLuxels[ 0 ][ k ].value[ c ] - g[ k ].value[ c ] ) );
+							sumCpu += lm->superLuxels[ 0 ][ k ].value[ c ];
+							sumGpu += g[ k ].value[ c ];
+						}
+					}
+					const light_t *l = trace.lights[ i ];
+					if ( ( maxDiff > 0.01f || !ok ) && l->type == ELightType::Sun ) {
+						/* one sun ray through the generic GPU ray path */
+						for ( size_t k = 0; k < count; ++k )
+						{
+							if ( lm->superLuxels[ 0 ][ k ].value[ 0 ] > 0 && g[ k ].value[ 0 ] == 0 ) {
+								trace_t t = trace;
+								t.light = l;
+								t.cluster = lm->superClusters[ k ];
+								t.origin = lm->superOrigins[ k ];
+								t.normal = lm->superNormals[ k ];
+								LightContributionToSample( &t );
+								fprintf( stderr, "  cpu sample: color ( %g %g %g ) opaque %d passSolid %d flags %x\n", t.color[ 0 ], t.color[ 1 ], t.color[ 2 ], t.opaque, t.passSolid, t.compileFlags );
+								t.end = t.origin + l->origin;
+								SetupTrace( &t );
+								t.testAll = true;
+								t.color = l->color * l->photons;
+								trace_t c = t;
+								TraceLine( &c );
+								GpuTraceBatch batch;
+								batch.add( t );
+								batch.run();
+								batch.apply( &t );
+								fprintf( stderr, "  ray cpu: opaque %d passSolid %d flags %x sky %x hit %g; gpu: opaque %d passSolid %d flags %x sky %x hit %g\n",
+								         c.opaque, c.passSolid, c.compileFlags, c.skyIndices[ 0 ], vector3_length( c.hit - c.origin ),
+								         t.opaque, t.passSolid, t.compileFlags, t.skyIndices[ 0 ], vector3_length( t.hit - t.origin ) );
+								break;
+							}
+						}
+					}
+					if ( maxDiff > 0.01f || !ok ) {
+						fprintf( stderr, "gpu light %d: ok %d type %d flags %x style %d envelope %g photons %g add %g cluster %d origin ( %g %g %g ) winding %zu: max diff %g, sum cpu %g gpu %g\n",
+						         i, ok, int( l->type ), static_cast<unsigned>( l->flags ), l->style, l->envelope, l->photons, l->add, l->cluster, l->origin[ 0 ], l->origin[ 1 ], l->origin[ 2 ], l->w.size(), maxDiff, sumCpu, sumGpu );
 					}
 				}
+				std::copy( keep.begin(), keep.end(), lm->superLuxels[ 0 ] );
 			}
-
-			for ( rawLightmap_t& slot : slots )
-			{
-				free( slot.superLuxels[0] );
-				free( slot.superDeluxels );
-				free( slot.superFlags );
-			}
-			splitWorkMemoryInUse -= numSlots * slotSize;
 		}
-		else
-		{
-			LuxelRect tmplmDirty{ 0, 0, lm->sw, lm->sh };
-			LightRegion region;
-			for ( int i = 0; i < trace.numLights; ++i )
-			{
-				/* setup trace */
-				trace.light = trace.lights[ i ];
-
-				/* style check */
-				lightmapNum = LightmapNumForLightStyle( lm, trace.light );
-				if ( lightmapNum < 0 ) {
-					continue;
-				}
-
-				/* allocate sampling flags storage */
-				if ( lightSamples > 1 || lightRandomSamples ) {
-					size = lm->sw * lm->sh * sizeof( *lm->superFlags );
-					if ( lm->superFlags == nullptr ) {
-						lm->superFlags = safe_malloc( size );
-					}
-					tmplm.superFlags = lm->superFlags;
-				}
-
-				/* compute this light's contribution, then add it */
-				if ( cull ) {
-					LightRegionFor( lightTiles, lm, trace.light, region );
-					if ( IlluminateRawLightmapLight( lm, tmplm, trace, splitRows, &region, &lightTiles, &tmplmDirty ) != 0 ) {
-						AccumulateRawLightmapLight( lm, tmplm, trace.light, lightmapNum, splitRows, &tmplmDirty );
-					}
-				}
-				else if ( IlluminateRawLightmapLight( lm, tmplm, trace, splitRows ) != 0 ) {
-					AccumulateRawLightmapLight( lm, tmplm, trace.light, lightmapNum, splitRows );
-				}
-			}
-		}
-
-		/* debugging aid for -splitwork: env Q3MAP2_DEBUG_SPLIT reports slow lightmaps */
-		if ( static const bool debugSplit = getenv( "Q3MAP2_DEBUG_SPLIT" ) != nullptr; debugSplit && splitTimer.elapsed_sec() > 2 ) {
-			fprintf( stderr, "split lm %d %dx%d lights %d mode %s slots %d: %.1f s\n", rawLightmapNum, lm->sw, lm->sh, trace.numLights,
-			         numSlots >= 2 ? "lights" : splitRows ? "rows" : "none", numSlots, splitTimer.elapsed_sec() );
+		else if ( !GpuIlluminateRawLightmap( lm, trace, true ) ) {
+			IlluminateRawLightmapLights( rawLightmapNum, lm, tmplm, trace, llSize, ldSize );
 		}
 
 		/* free temporary luxels */

@@ -2331,6 +2331,7 @@ static void EmbreeCheck( const trace_t& reference, const trace_t& trace ){
 namespace
 {
 bool gpuReady = false;
+std::vector<GpuInfo> gpuInfos;                  /* as uploaded */
 std::atomic<long long> gpuOverflowRays;
 
 struct GpuSceneBuilder
@@ -2455,12 +2456,51 @@ void SetupGpu(){
 	scene.numBspNodes = numBspTraceNodes;
 	scene.skyFlag = C_SKY;
 
+	/* the bsp tree, brushes and pvs: ClusterForPointExt(), ClusterVisible() */
+	GpuWorld& world = scene.world;
+	for ( const bspNode_t& node : bspNodes )
+		world.nodes.insert( world.nodes.end(), { node.planeNum, node.children[ 0 ], node.children[ 1 ], 0 } );
+	for ( const bspPlane_t& plane : bspPlanes )
+		world.planes.insert( world.planes.end(), { plane.normal()[ 0 ], plane.normal()[ 1 ], plane.normal()[ 2 ], plane.dist() } );
+	for ( const bspLeaf_t& leaf : bspLeafs )
+		world.leafs.insert( world.leafs.end(), { leaf.cluster, leaf.firstBSPLeafBrush, leaf.numBSPLeafBrushes, 0 } );
+	world.leafBrushes = bspLeafBrushes;
+	for ( const bspBrush_t& brush : bspBrushes )
+		world.brushes.insert( world.brushes.end(), { brush.firstSide, brush.numSides } );
+	for ( const bspBrushSide_t& side : bspBrushSides )
+		world.sides.push_back( side.planeNum );
+	for ( int b = 0; b <= maxOpaqueBrush && b < int( opaqueBrushes.size() ); ++b )
+		world.opaque.push_back( opaqueBrushes[ b ] ? 1 : 0 );
+	world.hasVis = bspVisBytes.size() > 8;
+	world.leafBytes = world.hasVis ? reinterpret_cast<const int*>( bspVisBytes.data() )[ 1 ] : 0;
+	world.vis.resize( ( bspVisBytes.size() + 3 ) / 4, 0 );
+	memcpy( world.vis.data(), bspVisBytes.data(), bspVisBytes.size() );
+
 	gpuReady = GpuSetup( scene );
+	gpuInfos = std::move( scene.infos );
 }
 }
 
 bool GpuTraceEnabled(){
 	return gpuReady;
+}
+
+/* shaders get their sky index when the sky lights are made, after SetupGpu() */
+void GpuRefreshTraceInfos(){
+	if ( !gpuReady ) {
+		return;
+	}
+	bool changed = false;
+	for ( int i = 0; i < numTraceInfos && i < int( gpuInfos.size() ); ++i )
+	{
+		if ( gpuInfos[ i ].skyIndex != traceInfos[ i ].si->skyIndex ) {
+			gpuInfos[ i ].skyIndex = traceInfos[ i ].si->skyIndex;
+			changed = true;
+		}
+	}
+	if ( changed ) {
+		GpuSetInfos( gpuInfos );
+	}
 }
 
 void GpuTraceBatch::add( const trace_t& trace ){
@@ -2578,6 +2618,8 @@ void GpuShutdownTrace(){
 #else
 bool GpuTraceEnabled(){
 	return false;
+}
+void GpuRefreshTraceInfos(){
 }
 void GpuTraceBatch::add( const trace_t& ){
 }
