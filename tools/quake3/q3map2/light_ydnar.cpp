@@ -31,8 +31,10 @@
 /* dependencies */
 #include "q3map2.h"
 #include "timer.h"
+#include "light_gpu.h"
 #include <atomic>
 #include <thread>
+#include <mutex>
 
 
 // http://www.graficaobscura.com/matrix/index.html
@@ -1447,30 +1449,8 @@ void SetupDirt(){
 }
 
 
-/*
-   DirtForSample()
-   calculates dirt value for a given sample
- */
-
-static float DirtForSample( trace_t *trace ){
-	int i;
-	float gatherDirt, outDirt, angle, elevation, ooDepth;
-	Vector3 myUp, myRt;
-
-
-	/* dummy check */
-	if ( !dirty ) {
-		return 1;
-	}
-	if ( trace == nullptr || trace->cluster < CLUSTER_NORMAL ) {
-		return 0;
-	}
-
-	/* setup */
-	gatherDirt = 0;
-	ooDepth = 1.0f / dirtDepth;
-	const Vector3 normal( trace->normal );
-
+/* the tangent space of dirt and floodlight rays */
+static void TangentBasis( const Vector3& normal, Vector3& myRt, Vector3& myUp ){
 	/* check if the normal is aligned to the world-up */
 	if ( normal[ 0 ] == 0 && normal[ 1 ] == 0 && ( normal[ 2 ] == 1 || normal[ 2 ] == -1 ) ) {
 		if ( normal[ 2 ] == 1 ) {
@@ -1487,6 +1467,117 @@ static float DirtForSample( trace_t *trace ){
 		myRt = VectorNormalized( vector3_cross( normal, g_vector3_axis_z ) );
 		myUp = VectorNormalized( vector3_cross( myRt, normal ) );
 	}
+}
+
+/* -gpu: a luxel for GpuGather() */
+static GpuGatherSample GatherSample( const trace_t& trace ){
+	Vector3 myRt, myUp;
+	TangentBasis( trace.normal, myRt, myUp );
+	GpuGatherSample sample;
+	for ( int i = 0; i < 3; ++i )
+	{
+		sample.origin[ i ] = trace.origin[ i ];
+		sample.normal[ i ] = trace.normal[ i ];
+		sample.right[ i ] = myRt[ i ];
+		sample.up[ i ] = myUp[ i ];
+	}
+	sample.origin[ 3 ] = sample.normal[ 3 ] = sample.right[ 3 ] = sample.up[ 3 ] = 0;
+	return sample;
+}
+
+/* -gpu: GpuGather() parameters shared by all rays of a lightmap */
+static GpuGatherParams GatherParams( const trace_t& trace, int mode, float rayLength, const std::vector<float>& vectors ){
+	GpuGatherParams params;
+	params.mode = mode;
+	params.rayLength = rayLength;
+	params.inhibitRadius = trace.inhibitRadius;
+	params.ooDepth = 1.0f / rayLength;
+	params.recvShadows = trace.recvShadows;
+	params.rayFlags = ( inGrid ? GPU_RAY_IN_GRID : 0 ) | ( noSurfaces ? GPU_RAY_NO_SURFACES : 0 );
+	params.translucentFlag = C_TRANSLUCENT;
+	params.surfaces = trace.surfaces;
+	params.numSurfaces = trace.numSurfaces;
+	params.vectors = vectors.data();
+	params.numVectors = int( vectors.size() / 3 );
+	return params;
+}
+
+/* debugging aid: env Q3MAP2_DEBUG_GPU_CHECK compares GpuGather() samples with the CPU's, printed at exit */
+namespace
+{
+struct GatherChecker
+{
+	const char *name;
+	std::atomic<long long> samples = 0, differ = 0, overflow = 0;
+	std::mutex mutex;
+	float maxDifference = 0;
+	explicit GatherChecker( const char *name ) : name( name ){
+	}
+	~GatherChecker(){
+		if ( samples != 0 ) {
+			fprintf( stderr, "gpu %s check: %lld samples, %lld differ (max difference %g), %lld traced on the CPU\n", name, samples.load(), differ.load(), maxDifference, overflow.load() );
+		}
+	}
+	void check( float gpu, float cpu ){
+		++samples;
+		if ( gpu != cpu ) {
+			++differ;
+			std::lock_guard lock( mutex );
+			value_maximize( maxDifference, std::fabs( gpu - cpu ) );
+		}
+	}
+};
+bool GatherCheckEnabled(){
+	static const bool check = getenv( "Q3MAP2_DEBUG_GPU_CHECK" ) != nullptr;
+	return check;
+}
+}
+
+/*
+   DirtForSample()
+   calculates dirt value for a given sample
+ */
+
+/* the dirt value from the sum of the rays */
+static float DirtFromGather( float gatherDirt ){
+	/* early out */
+	if ( gatherDirt <= 0 ) {
+		return 1;
+	}
+
+	/* apply gain (does this even do much? heh) */
+	float outDirt = std::min( 1.f, std::pow( gatherDirt / ( numDirtVectors + 1 ), dirtGain ) );
+
+	/* apply scale */
+	outDirt *= dirtScale;
+	value_minimize( outDirt, 1.0f );
+
+	/* return to sender */
+	return 1.0f - outDirt;
+}
+
+/* traceLine( trace ) traces the rays: TraceLine(), or collecting / applying GPU batches */
+template<typename TraceFn>
+static float DirtForSampleT( trace_t *trace, TraceFn&& traceLine ){
+	int i;
+	float gatherDirt, angle, elevation, ooDepth;
+	Vector3 myUp, myRt;
+
+
+	/* dummy check */
+	if ( !dirty ) {
+		return 1;
+	}
+	if ( trace == nullptr || trace->cluster < CLUSTER_NORMAL ) {
+		return 0;
+	}
+
+	/* setup */
+	gatherDirt = 0;
+	ooDepth = 1.0f / dirtDepth;
+	const Vector3 normal( trace->normal );
+
+	TangentBasis( normal, myRt, myUp );
 
 	/* 1 = random mode, 0 (well everything else) = non-random mode */
 	if ( dirtMode == 1 ) {
@@ -1509,7 +1600,7 @@ static float DirtForSample( trace_t *trace ){
 			trace->color.set( 1 );
 
 			/* trace */
-			TraceLine( trace );
+			traceLine( trace );
 			if ( trace->opaque && !( trace->compileFlags & C_SKY ) ) {
 				gatherDirt += 1.0f - ooDepth * vector3_length( trace->hit - trace->origin );
 			}
@@ -1529,7 +1620,7 @@ static float DirtForSample( trace_t *trace ){
 			trace->color.set( 1 );
 
 			/* trace */
-			TraceLine( trace );
+			traceLine( trace );
 			if ( trace->opaque ) {
 				gatherDirt += 1.0f - ooDepth * vector3_length( trace->hit - trace->origin );
 			}
@@ -1542,25 +1633,16 @@ static float DirtForSample( trace_t *trace ){
 	trace->color.set( 1 );
 
 	/* trace */
-	TraceLine( trace );
+	traceLine( trace );
 	if ( trace->opaque ) {
 		gatherDirt += 1.0f - ooDepth * vector3_length( trace->hit - trace->origin );
 	}
 
-	/* early out */
-	if ( gatherDirt <= 0 ) {
-		return 1;
-	}
+	return DirtFromGather( gatherDirt );
+}
 
-	/* apply gain (does this even do much? heh) */
-	outDirt = std::min( 1.f, std::pow( gatherDirt / ( numDirtVectors + 1 ), dirtGain ) );
-
-	/* apply scale */
-	outDirt *= dirtScale;
-	value_minimize( outDirt, 1.0f );
-
-	/* return to sender */
-	return 1.0f - outDirt;
+static float DirtForSample( trace_t *trace ){
+	return DirtForSampleT( trace, TraceLine );
 }
 
 
@@ -1620,40 +1702,88 @@ void DirtyRawLightmap( int rawLightmapNum ){
 		}
 	}
 
-	/* gather dirt; every luxel is independent, so with -splitwork blocks of rows run in parallel */
-	const int rowsPerBlock = threadsHelpWithJobs ? std::max( 1, 2048 / std::max( lm.sw, 1 ) ) : lm.sh;
+	/* gather dirt; every luxel is independent, so with -splitwork blocks of rows run in parallel;
+	   with -gpu a block's rays are traced at once */
+	const bool gpu = GpuTraceEnabled() && dirty;
+	const int rowsPerBlock = gpu ? std::max( 1, GPU_BATCH_RAYS / std::max( lm.sw * ( numDirtVectors + 1 ), 1 ) )
+	                       : threadsHelpWithJobs ? std::max( 1, 2048 / std::max( lm.sw, 1 ) ) : lm.sh;
 	ParallelFor( ( lm.sh + rowsPerBlock - 1 ) / rowsPerBlock, [&]( int block ){
 		trace_t blockTrace = trace;
-		for ( int y = block * rowsPerBlock; y < std::min( lm.sh, ( block + 1 ) * rowsPerBlock ); ++y )
-		{
-			for ( int x = 0; x < lm.sw; ++x )
+		const auto luxels = [&]( auto&& dirtForSample ){
+			for ( int y = block * rowsPerBlock; y < std::min( lm.sh, ( block + 1 ) * rowsPerBlock ); ++y )
 			{
-				/* get luxel */
-				const int cluster = lm.getSuperCluster( x, y );
-				float& dirt = lm.getSuperDirt( x, y );
+				for ( int x = 0; x < lm.sw; ++x )
+				{
+					/* get luxel */
+					const int cluster = lm.getSuperCluster( x, y );
+					float& dirt = lm.getSuperDirt( x, y );
 
-				/* set default dirt */
-				dirt = 0;
+					/* set default dirt */
+					dirt = 0;
 
-				/* only look at mapped luxels */
-				if ( cluster < CLUSTER_NORMAL ) {
-					continue;
+					/* only look at mapped luxels */
+					if ( cluster < CLUSTER_NORMAL ) {
+						continue;
+					}
+
+					/* don't apply dirty on this surface */
+					if ( noDirty ) {
+						dirt = 1;
+						continue;
+					}
+
+					/* copy to trace */
+					blockTrace.cluster = cluster;
+					blockTrace.origin = lm.getSuperOrigin( x, y );
+					blockTrace.normal = lm.getSuperNormal( x, y );
+
+					/* get dirt */
+					dirt = dirtForSample( &blockTrace );
 				}
-
-				/* don't apply dirty on this surface */
-				if ( noDirty ) {
-					dirt = 1;
-					continue;
-				}
-
-				/* copy to trace */
-				blockTrace.cluster = cluster;
-				blockTrace.origin = lm.getSuperOrigin( x, y );
-				blockTrace.normal = lm.getSuperNormal( x, y );
-
-				/* get dirt */
-				dirt = DirtForSample( &blockTrace );
 			}
+		};
+
+		if ( gpu && dirtMode != 1 ) {
+			/* the GPU makes and traces the rays of the luxels and sums them per luxel */
+			std::vector<GpuGatherSample> samples;
+			luxels( [&]( trace_t *t ){
+				samples.push_back( GatherSample( *t ) );
+				return 0.f;
+			} );
+			std::vector<float> vectors;
+			for ( int i = 0; i < numDirtVectors; ++i )
+				vectors.insert( vectors.end(), { dirtVectors[ i ][ 0 ], dirtVectors[ i ][ 1 ], dirtVectors[ i ][ 2 ] } );
+			vectors.insert( vectors.end(), { 0, 0, 1 } ); /* direct ray: the normal */
+			std::vector<GpuGatherOut> outs( samples.size() );
+			GpuGather( GatherParams( blockTrace, GPU_GATHER_DIRT, dirtDepth, vectors ), samples.data(), samples.size(), outs.data() );
+			size_t next = 0;
+			luxels( [&]( trace_t *t ){
+				const GpuGatherOut& out = outs[ next++ ];
+				static GatherChecker checker( "dirt" );
+				if ( out.flags & GPU_GATHER_OVERFLOW ) {
+					++checker.overflow;
+					return DirtForSample( t );
+				}
+				const float dirt = DirtFromGather( out.gather );
+				if ( GatherCheckEnabled() ) {
+					checker.check( dirt, DirtForSample( t ) );
+				}
+				return dirt;
+			} );
+		}
+		else if ( gpu ) {
+			/* random dirt: collect the rays, trace them, then use the results in the same order */
+			GpuTraceBatch batch;
+			luxels( [&]( trace_t *t ){
+				return DirtForSampleT( t, [&]( trace_t *ray ){ batch.add( *ray ); ray->opaque = false; ray->compileFlags = 0; } );
+			} );
+			batch.run();
+			luxels( [&]( trace_t *t ){
+				return DirtForSampleT( t, [&]( trace_t *ray ){ batch.apply( ray ); } );
+			} );
+		}
+		else{
+			luxels( []( trace_t *t ){ return DirtForSample( t ); } );
 		}
 	} );
 
@@ -3986,10 +4116,25 @@ void SetupFloodLight(){
    once again, kudos to the dirtmapping coder
  */
 
-float FloodLightForSample( trace_t *trace, float floodLightDistance, bool floodLightLowQuality ){
+/* the floodlight value from the sum of the rays */
+static float FloodLightFromGather( float gatherLight, int vecs ){
+	/* early out */
+	if ( gatherLight <= 0 ) {
+		return 0;
+	}
+
+	gatherLight /= std::max( 1, vecs );
+
+	/* return to sender */
+	return std::min( 1.f, gatherLight );
+}
+
+/* traceLine( trace ) traces the rays: TraceLine(), or collecting / applying GPU batches */
+template<typename TraceFn>
+static float FloodLightForSampleT( trace_t *trace, float floodLightDistance, bool floodLightLowQuality, TraceFn&& traceLine ){
 	int i;
 	float contribution;
-	float gatherLight, outLight;
+	float gatherLight;
 	Vector3 myUp, myRt;
 	int vecs = 0;
 
@@ -4006,22 +4151,7 @@ float FloodLightForSample( trace_t *trace, float floodLightDistance, bool floodL
 	const float dd = floodLightDistance;
 	const Vector3 normal( trace->normal );
 
-	/* check if the normal is aligned to the world-up */
-	if ( normal[ 0 ] == 0 && normal[ 1 ] == 0 && ( normal[ 2 ] == 1 || normal[ 2 ] == -1 ) ) {
-		if ( normal[ 2 ] == 1 ) {
-			myRt = g_vector3_axis_x;
-			myUp = g_vector3_axis_y;
-		}
-		else if ( normal[ 2 ] == -1 ) {
-			myRt = -g_vector3_axis_x;
-			myUp = g_vector3_axis_y;
-		}
-	}
-	else
-	{
-		myRt = VectorNormalized( vector3_cross( normal, g_vector3_axis_z ) );
-		myUp = VectorNormalized( vector3_cross( myRt, normal ) );
-	}
+	TangentBasis( normal, myRt, myUp );
 
 	/* vortex: optimise floodLightLowQuality a bit */
 	if ( floodLightLowQuality ) {
@@ -4049,7 +4179,7 @@ float FloodLightForSample( trace_t *trace, float floodLightDistance, bool floodL
 			SetupTrace( trace );
 			trace->color.set( 1 );
 			/* trace */
-			TraceLine( trace );
+			traceLine( trace );
 			contribution = 1;
 
 			if ( trace->compileFlags & C_SKY || trace->compileFlags & C_TRANSLUCENT ) {
@@ -4069,17 +4199,11 @@ float FloodLightForSample( trace_t *trace, float floodLightDistance, bool floodL
 		}
 	}
 
-	/* early out */
-	if ( gatherLight <= 0 ) {
-		return 0;
-	}
+	return FloodLightFromGather( gatherLight, vecs );
+}
 
-	gatherLight /= std::max( 1, vecs );
-
-	outLight = std::min( 1.f, gatherLight );
-
-	/* return to sender */
-	return outLight;
+float FloodLightForSample( trace_t *trace, float floodLightDistance, bool floodLightLowQuality ){
+	return FloodLightForSampleT( trace, floodLightDistance, floodLightLowQuality, TraceLine );
 }
 
 /*
@@ -4123,38 +4247,79 @@ static void FloodLightRawLightmapPass( rawLightmap_t *lm, Vector3& lmFloodLightR
 		}
 	}
 
-	/* gather floodlight; every luxel is independent, so with -splitwork blocks of rows run in parallel */
-	const int rowsPerBlock = threadsHelpWithJobs ? std::max( 1, 2048 / std::max( lm->sw, 1 ) ) : lm->sh;
+	/* gather floodlight; every luxel is independent, so with -splitwork blocks of rows run in parallel;
+	   with -gpu a block's rays are traced at once */
+	const bool gpu = GpuTraceEnabled() && !lmFloodLightLowQuality && numFloodVectors > 0;
+	const int rowsPerBlock = gpu ? std::max( 1, GPU_BATCH_RAYS / std::max( lm->sw * numFloodVectors, 1 ) )
+	                       : threadsHelpWithJobs ? std::max( 1, 2048 / std::max( lm->sw, 1 ) ) : lm->sh;
 	ParallelFor( ( lm->sh + rowsPerBlock - 1 ) / rowsPerBlock, [&]( int block ){
 		trace_t blockTrace = trace;
-		for ( int y = block * rowsPerBlock; y < std::min( lm->sh, ( block + 1 ) * rowsPerBlock ); ++y )
-		{
-			for ( int x = 0; x < lm->sw; ++x )
+		/* add = false: only collecting the rays */
+		const auto luxels = [&]( auto&& floodLightForSample, bool add ){
+			for ( int y = block * rowsPerBlock; y < std::min( lm->sh, ( block + 1 ) * rowsPerBlock ); ++y )
 			{
-				/* get luxel */
-				const int cluster = lm->getSuperCluster( x, y );
-				SuperFloodLight& floodlight = lm->getSuperFloodLight( x, y );
+				for ( int x = 0; x < lm->sw; ++x )
+				{
+					/* get luxel */
+					const int cluster = lm->getSuperCluster( x, y );
+					SuperFloodLight& floodlight = lm->getSuperFloodLight( x, y );
 
-				/* set default dirt */
-				floodlight.value[0] = 0;
+					/* set default dirt */
+					floodlight.value[0] = 0;
 
-				/* only look at mapped luxels */
-				if ( cluster < CLUSTER_NORMAL ) {
-					continue;
+					/* only look at mapped luxels */
+					if ( cluster < CLUSTER_NORMAL ) {
+						continue;
+					}
+
+					/* copy to trace */
+					blockTrace.cluster = cluster;
+					blockTrace.origin = lm->getSuperOrigin( x, y );
+					blockTrace.normal = lm->getSuperNormal( x, y );
+
+					/* get floodlight */
+					const float floodLightAmount = floodLightForSample( &blockTrace ) * lmFloodLightIntensity;
+
+					/* add floodlight */
+					if ( add ) {
+						floodlight.value += lmFloodLightRGB * floodLightAmount;
+						floodlight.scale += floodlightDirectionScale;
+					}
 				}
-
-				/* copy to trace */
-				blockTrace.cluster = cluster;
-				blockTrace.origin = lm->getSuperOrigin( x, y );
-				blockTrace.normal = lm->getSuperNormal( x, y );
-
-				/* get floodlight */
-				const float floodLightAmount = FloodLightForSample( &blockTrace, lmFloodLightDistance, lmFloodLightLowQuality ) * lmFloodLightIntensity;
-
-				/* add floodlight */
-				floodlight.value += lmFloodLightRGB * floodLightAmount;
-				floodlight.scale += floodlightDirectionScale;
 			}
+		};
+
+		if ( gpu ) {
+			/* the GPU makes and traces the rays of the luxels and sums them per luxel */
+			std::vector<GpuGatherSample> samples;
+			luxels( [&]( trace_t *t ){
+				samples.push_back( GatherSample( *t ) );
+				return 0.f;
+			}, false );
+			std::vector<float> vectors;
+			for ( int i = 0; i < numFloodVectors; ++i )
+				vectors.insert( vectors.end(), { floodVectors[ i ][ 0 ], floodVectors[ i ][ 1 ], floodVectors[ i ][ 2 ] } );
+			std::vector<GpuGatherOut> outs( samples.size() );
+			GpuGather( GatherParams( blockTrace, GPU_GATHER_FLOODLIGHT, lmFloodLightDistance, vectors ), samples.data(), samples.size(), outs.data() );
+			size_t next = 0;
+			luxels( [&]( trace_t *t ){
+				const GpuGatherOut& out = outs[ next++ ];
+				static GatherChecker checker( "floodlight" );
+				if ( out.flags & GPU_GATHER_OVERFLOW ) {
+					++checker.overflow;
+					return FloodLightForSample( t, lmFloodLightDistance, lmFloodLightLowQuality );
+				}
+				const float floodlight = FloodLightFromGather( out.gather, numFloodVectors );
+				if ( GatherCheckEnabled() ) {
+					checker.check( floodlight, FloodLightForSample( t, lmFloodLightDistance, lmFloodLightLowQuality ) );
+				}
+				return floodlight;
+			}, true );
+		}
+		else{
+			luxels( [&]( trace_t *t ){
+				return FloodLightForSample( t, lmFloodLightDistance, lmFloodLightLowQuality );
+			}, true );
 		}
 	} );
 

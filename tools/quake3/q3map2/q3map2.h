@@ -2101,6 +2101,7 @@ inline bool noTrace;
 inline bool noSurfaces;
 inline bool lightEmbree;                /* -embree: trace rays with Intel Embree */
 inline bool lightCull;                  /* -lightcull: only light the lightmap tiles a light can reach */
+inline bool lightGpu;                   /* -gpu: trace rays on a Vulkan GPU */
 inline bool patchShadows;
 inline bool cpmaHack;
 

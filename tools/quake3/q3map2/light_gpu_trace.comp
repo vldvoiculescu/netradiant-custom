@@ -1,0 +1,784 @@
+/* -------------------------------------------------------------------------------
+
+   q3map2 -gpu: traces a batch of rays like TraceLineEmbree() in light_trace.cpp
+
+   the acceleration structure holds the clipped trace node triangles, enlarged by 1.06 about their
+   center, so it reports every triangle ydnar's TraceTriangle() could accept with its epsilons.
+   each candidate gets the exact TraceTriangle() tests and the check that TraceLine_r() would visit
+   the triangle's leaf. the structs here match light_gpu.h.
+
+   ------------------------------------------------------------------------------- */
+
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+
+layout( local_size_x = 64 ) in;
+
+layout( set = 0, binding = 0 ) uniform accelerationStructureEXT tlas;
+
+struct Ray { vec4 originInhibit; vec4 endDistance; vec4 directionRecv; vec4 colorSky; ivec4 misc; };
+struct Hit { vec4 hitDepth; vec4 color; uvec4 misc; };
+struct Tri { vec4 v0Info; vec4 edge1Path; vec4 edge2PathLength; vec4 st01; vec4 st2Item; };
+struct Info { ivec4 a; ivec4 b; };
+struct Node { vec4 plane; ivec4 misc; };
+
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Rays { Ray r[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) writeonly buffer Hits { Hit h[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Tris { Tri t[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Infos { Info i[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Nodes { Node n[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) readonly buffer Uints { uint u[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) readonly buffer Ints { int i[]; };
+
+/* gathers (dirt, floodlight): the GPU makes the rays of each sample from a set of tangent space vectors */
+struct Sample { vec4 origin; vec4 normal; vec4 right; vec4 up; };
+struct RayValue { double value; uint flags; uint pad; };
+struct GatherOut { float gather; uint flags; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Samples { Sample s[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Vectors { vec4 v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) buffer RayValues { RayValue r[]; };
+layout( buffer_reference, std430, buffer_reference_align = 8 ) writeonly buffer GatherOuts { GatherOut o[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Params
+{
+	Samples samples;
+	Vectors vectors;
+	RayValues values;
+	GatherOuts outs;
+	uint numSamples;
+	uint numVectors;
+	uint mode;                                  /* GATHER_* */
+	float rayLength;
+	float inhibitRadius;
+	int recvShadows;
+	int numSurfaces;
+	uint rayFlags;                              /* GPU_RAY_IN_GRID, GPU_RAY_NO_SURFACES */
+	uint translucentFlag;                       /* C_TRANSLUCENT */
+	float ooDepth;                              /* dirt: 1 / dirtDepth */
+};
+
+layout( push_constant ) uniform Constants
+{
+	Rays rays;
+	Hits hits;
+	Ints surfaces;
+	Tris tris;
+	Infos infos;
+	Nodes nodes;
+	Uints paths;
+	Uints images;
+	uint count;
+	int headNode;
+	int numBspNodes;
+	uint skyFlag;
+	uint debugMode;                             /* Q3MAP2_DEBUG_GPU_MODE: DEBUG_* bits */
+	uint kernel;                                /* KERNEL_* */
+	Params params;                              /* KERNEL_GATHER_* */
+} pc;
+
+const uint KERNEL_TRACE = 0;                    /* trace pc.rays into pc.hits */
+const uint KERNEL_GATHER_RAYS = 1;              /* trace the rays of the samples, a value per ray */
+const uint KERNEL_GATHER_REDUCE = 2;            /* sum the values of each sample, in the CPU's order */
+
+const uint GATHER_DIRT = 0;                     /* DirtForSample(), dirtMode 0 */
+const uint GATHER_FLOODLIGHT = 1;               /* FloodLightForSample() */
+
+const uint GATHER_OVERFLOW = 1;                 /* a ray needs the CPU: so does the sample */
+
+/* light_gpu.h */
+const uint GPU_RAY_TEST_ALL = 1;
+const uint GPU_RAY_TREE_ORDER = 2;
+const uint GPU_RAY_IN_GRID = 4;
+const uint GPU_RAY_NO_SURFACES = 8;
+const uint GPU_RAY_SKIP = 16;
+
+const uint GPU_HIT_OPAQUE = 1;
+const uint GPU_HIT_PASS_SOLID = 2;
+const uint GPU_HIT_POINT = 4;
+const uint GPU_HIT_DEPTH = 8;
+const uint GPU_HIT_FORCE_SUBSAMPLING = 16;
+const uint GPU_HIT_OVERFLOW = 32;
+
+const int GPU_INFO_OPAQUE = 0;
+const int GPU_INFO_SKY = 1;
+const int GPU_INFO_FILTER = 2;
+const int GPU_INFO_FILTER_COLOR = 4;
+const int GPU_INFO_FILTER_SHADOW = 8;
+
+/* light_trace.cpp */
+const float TRACE_ON_EPSILON = 0.1;
+const int TRACE_LEAF_SOLID = -2;
+const float BARY_EPSILON = 0.01;
+const float ASLF_EPSILON = 0.0001;
+const float COPLANAR_EPSILON = 0.25;
+const float SELF_SHADOW_EPSILON = 0.5;
+
+/* TriangleTest */
+const int TEST_IGNORED = 0;
+const int TEST_FLAGS = 1;
+const int TEST_SKY = 2;
+const int TEST_FILTER = 3;
+const int TEST_OPAQUE = 4;
+
+/* debugging aid: parts of the work to skip, to measure their cost */
+const uint DEBUG_NO_TRACE = 1;
+const uint DEBUG_NO_SOLID = 2;
+const uint DEBUG_NO_LEAF = 4;
+const uint DEBUG_NO_CLASSIFY = 8;
+
+/* triangles that don't stop the ray but count for its result; more and the CPU traces the ray */
+const int MAX_PASSED = 16;
+/* TraceSolid() stack; deeper and the CPU traces the ray */
+const int SOLID_STACK = 64;
+
+/* the ray */
+vec3 rOrigin, rEnd, rDirection;
+float rInhibit, rDistance;
+int rRecvShadows, rLightSky, rSurfacesOffset, rNumSurfaces;
+uint rFlags;
+
+/* the CPU's float math, without fused multiply-adds */
+precise float Dot( vec3 a, vec3 b ){
+	precise float d = a.x * b.x + a.y * b.y + a.z * b.z;
+	return d;
+}
+
+precise vec3 Cross( vec3 a, vec3 b ){
+	precise vec3 c = vec3( a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x );
+	return c;
+}
+
+precise float PlaneDistance( Node node, vec3 p ){
+	const int type = node.misc.x;
+	precise float d = type < 3 ? p[ type ] - node.plane.w : Dot( p, node.plane.xyz ) - node.plane.w;
+	return d;
+}
+
+precise vec3 Split( vec3 origin, vec3 end, float front, float back ){
+	precise vec3 mid = origin + ( end - origin ) * ( front / ( front - back ) );
+	return mid;
+}
+
+/* TraceSolid_r(): 1 = solid space at hit, 0 = none, -1 = stack overflow */
+int TraceSolid( vec3 origin, vec3 end, out vec3 hit ){
+	int stackNode[ SOLID_STACK ];
+	vec3 stackOrigin[ SOLID_STACK ];
+	vec3 stackEnd[ SOLID_STACK ];
+	int sp = 0;
+	const bool testAll = ( rFlags & GPU_RAY_TEST_ALL ) != 0;
+	int nodeNum = pc.headNode;
+	hit = origin;
+
+	for ( ;; )
+	{
+		bool done = true;
+		if ( nodeNum < 0 ) {
+			hit = origin;
+			return 1;
+		}
+		if ( nodeNum < pc.numBspNodes ) {
+			const Node node = pc.nodes.n[ nodeNum ];
+			const int type = node.misc.x;
+			if ( type == TRACE_LEAF_SOLID ) {
+				hit = origin;
+				return 1;
+			}
+			if ( type >= 0 && !( testAll && node.misc.w == 0 ) ) {
+				precise float front = PlaneDistance( node, origin );
+				precise float back = PlaneDistance( node, end );
+				if ( front >= -TRACE_ON_EPSILON && back >= -TRACE_ON_EPSILON ) {
+					nodeNum = node.misc.y;
+					continue;
+				}
+				if ( front < TRACE_ON_EPSILON && back < TRACE_ON_EPSILON ) {
+					nodeNum = node.misc.z;
+					continue;
+				}
+				const bool backFirst = front < 0;
+				precise vec3 mid = Split( origin, end, front, back );
+				if ( sp == SOLID_STACK ) {
+					return -1;
+				}
+				stackNode[ sp ] = backFirst ? node.misc.y : node.misc.z;
+				stackOrigin[ sp ] = mid;
+				stackEnd[ sp ] = end;
+				++sp;
+				nodeNum = backFirst ? node.misc.z : node.misc.y;
+				end = mid;
+				continue;
+			}
+		}
+		/* nothing below this node: the next segment */
+		if ( sp == 0 ) {
+			return 0;
+		}
+		--sp;
+		nodeNum = stackNode[ sp ];
+		origin = stackOrigin[ sp ];
+		end = stackEnd[ sp ];
+	}
+}
+
+/* RayPassesLeaf(): whether TraceLine_r() visits the leaf, and where the ray enters it */
+bool RayPassesLeaf( int offset, int length, out float leafEntry ){
+	vec3 origin = rOrigin;
+	vec3 end = rEnd;
+	leafEntry = 0;
+	for ( int i = 0; i < length; ++i )
+	{
+		const uint p = pc.paths.u[ offset + i ];
+		const Node node = pc.nodes.n[ int( p & 0x7fffffffu ) ];
+		const int side = int( p >> 31 );
+		precise float front = PlaneDistance( node, origin );
+		precise float back = PlaneDistance( node, end );
+		if ( front >= -TRACE_ON_EPSILON && back >= -TRACE_ON_EPSILON ) {
+			if ( side != 0 ) {
+				return false;
+			}
+		}
+		else if ( front < TRACE_ON_EPSILON && back < TRACE_ON_EPSILON ) {
+			if ( side != 1 ) {
+				return false;
+			}
+		}
+		else
+		{
+			const int first = front < 0 ? 1 : 0;
+			precise vec3 mid = Split( origin, end, front, back );
+			if ( side == first ) {
+				end = mid;
+			}
+			else{
+				origin = mid;
+			}
+		}
+	}
+	precise vec3 d = origin - rOrigin;
+	precise float lengthSquared = Dot( d, d );
+	leafEntry = sqrt( lengthSquared );
+	return true;
+}
+
+struct Result
+{
+	int test;
+	int tri;
+	float depth;
+	float leafEntry;
+	int item;
+	int kind;
+	vec3 filterColor;
+	float filterShadow;
+};
+
+/* TestTraceTriangle() + RayPassesLeaf() = ClassifyTriangle() */
+Result Classify( int tri ){
+	Result r;
+	r.test = TEST_IGNORED;
+	r.tri = tri;
+	r.depth = 0;
+	r.leafEntry = 0;
+	r.item = 0;
+	r.kind = 0;
+	r.filterColor = vec3( 1 );
+	r.filterShadow = 1;
+
+	const Tri tt = pc.tris.t[ tri ];
+	const Info ti = pc.infos.i[ floatBitsToInt( tt.v0Info.w ) ];
+	const int castShadows = ti.a.x;
+
+	/* worldspawn group only receives shadows from positive groups */
+	if ( rRecvShadows == 1 ) {
+		if ( castShadows <= 0 ) {
+			return r;
+		}
+	}
+	/* receive shadows from same group and worldspawn group */
+	else if ( rRecvShadows > 1 ) {
+		if ( castShadows != 1 && abs( castShadows ) != abs( rRecvShadows ) ) {
+			return r;
+		}
+	}
+	/* receive shadows from the same group only (< 0) */
+	else
+	{
+		if ( abs( castShadows ) != abs( rRecvShadows ) ) {
+			return r;
+		}
+	}
+
+	/* skip patches when doing the grid */
+	if ( ( rFlags & GPU_RAY_IN_GRID ) != 0 && ti.a.z != 0 ) {
+		return r;
+	}
+
+	const vec3 edge1 = tt.edge1Path.xyz;
+	const vec3 edge2 = tt.edge2PathLength.xyz;
+	precise vec3 pvec = Cross( rDirection, edge2 );
+	precise float det = Dot( edge1, pvec );
+	if ( abs( det ) < COPLANAR_EPSILON ) {
+		return r;
+	}
+	precise float invDet = 1.0 / det;
+	precise vec3 tvec = rOrigin - tt.v0Info.xyz;
+	precise float u = Dot( tvec, pvec ) * invDet;
+	if ( u < -BARY_EPSILON || u > ( 1.0 + BARY_EPSILON ) ) {
+		return r;
+	}
+	precise vec3 qvec = Cross( tvec, edge1 );
+	precise float v = Dot( rDirection, qvec ) * invDet;
+	if ( v < -BARY_EPSILON || ( u + v ) > ( 1.0 + BARY_EPSILON ) ) {
+		return r;
+	}
+	precise float depth = Dot( edge2, qvec ) * invDet;
+	r.depth = depth;
+	if ( depth <= rInhibit || depth >= rDistance ) {
+		return r;
+	}
+
+	/* self-shadowing */
+	if ( depth <= SELF_SHADOW_EPSILON ) {
+		for ( int i = 0; i < rNumSurfaces; ++i )
+		{
+			if ( pc.surfaces.i[ rSurfacesOffset + i ] == ti.a.y ) {
+				return r;
+			}
+		}
+	}
+
+	r.kind = ti.b.y;
+	const int kind = r.kind & 3;
+	if ( kind == GPU_INFO_SKY ) {
+		r.test = TEST_SKY;
+	}
+	else if ( kind == GPU_INFO_OPAQUE ) {
+		r.test = TEST_OPAQUE;
+	}
+	else{
+		r.test = TEST_FLAGS;
+		/* try to avoid double shadows near triangle seams */
+		if ( !( u < -ASLF_EPSILON || u > ( 1.0 + ASLF_EPSILON ) ||
+		        v < -ASLF_EPSILON || ( u + v ) > ( 1.0 + ASLF_EPSILON ) ) ) {
+			precise float w = 1.0 - ( u + v );
+			precise float s = w * tt.st01.x + u * tt.st01.z + v * tt.st2Item.x;
+			precise float t = w * tt.st01.y + u * tt.st01.w + v * tt.st2Item.y;
+			s = s - floor( s );
+			t = t - floor( t );
+			const int width = ti.b.w >> 16;
+			const int height = ti.b.w & 0xffff;
+			const int is = clamp( int( s * float( width ) ), 0, width - 1 );
+			const int it = clamp( int( t * float( height ) ), 0, height - 1 );
+			const uint pixel = pc.images.u[ ti.b.z + it * width + is ];
+			r.test = TEST_FILTER;
+			r.filterColor = vec3( float( pixel & 0xffu ), float( ( pixel >> 8 ) & 0xffu ), float( ( pixel >> 16 ) & 0xffu ) ) * ( 1.0 / 255.0 );
+			r.filterShadow = ( 1.0 / 255.0 ) * float( 255u - ( pixel >> 24 ) );
+		}
+	}
+
+	/* TraceLine() only tests the triangle when the ray passes its leaf */
+	if ( ( pc.debugMode & DEBUG_NO_LEAF ) == 0 && !RayPassesLeaf( floatBitsToInt( tt.edge1Path.w ), floatBitsToInt( tt.edge2PathLength.w ), r.leafEntry ) ) {
+		r.test = TEST_IGNORED;
+	}
+	r.item = floatBitsToInt( tt.st2Item.z );
+	return r;
+}
+
+bool TreeOrderLess( float entryA, int itemA, float entryB, int itemB ){
+	return entryA < entryB || ( entryA == entryB && itemA < itemB );
+}
+
+/* TraceLineEmbree() for the ray in the r* globals */
+void Trace( vec3 inColor, out vec3 hitPoint, out float hitDepth, out vec3 outColor, out uint compileFlags, out uint status, out uint skyBits ){
+	hitPoint = rOrigin;
+	hitDepth = 0;
+	precise vec3 color = inColor;
+	compileFlags = 0;
+	status = 0;
+	skyBits = 0;
+
+	for ( ;; ) /* one pass, break = done */
+	{
+		if ( ( rFlags & GPU_RAY_SKIP ) != 0 || ( pc.debugMode & DEBUG_NO_TRACE ) != 0 ) {
+			break;
+		}
+
+		/* solid space */
+		float segment = rDistance;
+		vec3 solidHit;
+		const int solid = ( pc.debugMode & DEBUG_NO_SOLID ) != 0 ? 0 : TraceSolid( rOrigin, rEnd, solidHit );
+		if ( solid < 0 ) {
+			status = GPU_HIT_OVERFLOW;
+			break;
+		}
+		if ( solid > 0 ) {
+			status |= GPU_HIT_PASS_SOLID | GPU_HIT_POINT;
+			hitPoint = solidHit;
+			if ( ( rFlags & GPU_RAY_TEST_ALL ) == 0 ) {
+				status |= GPU_HIT_OPAQUE;
+				break;
+			}
+			/* surfaces up to the edge of solid space (e.g. sky) count */
+			precise vec3 d = solidHit - rOrigin;
+			precise float lengthSquared = Dot( d, d );
+			segment = min( segment, sqrt( lengthSquared ) + 1.0 );
+		}
+
+		if ( ( rFlags & GPU_RAY_NO_SURFACES ) != 0 ) {
+			break;
+		}
+
+		const bool treeOrder = ( rFlags & GPU_RAY_TREE_ORDER ) != 0;
+		Result opaque;
+		opaque.test = TEST_IGNORED;
+
+		int passedTri[ MAX_PASSED ];
+		int passedTest[ MAX_PASSED ];
+		float passedDepth[ MAX_PASSED ];
+		float passedEntry[ MAX_PASSED ];
+		int passedItem[ MAX_PASSED ];
+		int passedKind[ MAX_PASSED ];
+		vec3 passedColor[ MAX_PASSED ];
+		float passedShadow[ MAX_PASSED ];
+		int numPassed = 0;
+		bool overflow = false;
+
+		rayQueryEXT query;
+		rayQueryInitializeEXT( query, tlas, gl_RayFlagsNoOpaqueEXT, 0xff, rOrigin, 0.0, rDirection, segment );
+		while ( rayQueryProceedEXT( query ) )
+		{
+			const int tri = rayQueryGetIntersectionPrimitiveIndexEXT( query, false );
+			if ( ( pc.debugMode & DEBUG_NO_CLASSIFY ) != 0 ) {
+				rayQueryConfirmIntersectionEXT( query );
+				continue;
+			}
+			const Result r = Classify( tri );
+			if ( r.test == TEST_IGNORED ) {
+				continue;
+			}
+			if ( r.test == TEST_OPAQUE ) {
+				if ( treeOrder ) {
+					if ( opaque.test != TEST_OPAQUE || TreeOrderLess( r.leafEntry, r.item, opaque.leafEntry, opaque.item ) ) {
+						opaque = r;
+					}
+				}
+				else if ( opaque.test != TEST_OPAQUE || r.depth < opaque.depth ) {
+					/* the nearest: shortens the ray */
+					opaque = r;
+					rayQueryConfirmIntersectionEXT( query );
+				}
+				continue;
+			}
+			bool seen = false;
+			for ( int i = 0; i < numPassed; ++i )
+			{
+				if ( passedTri[ i ] == tri ) {
+					seen = true;
+				}
+			}
+			if ( seen ) {
+				continue;
+			}
+			if ( numPassed == MAX_PASSED ) {
+				overflow = true;
+				rayQueryTerminateEXT( query );
+				break;
+			}
+			passedTri[ numPassed ] = tri;
+			passedTest[ numPassed ] = r.test;
+			passedDepth[ numPassed ] = r.depth;
+			passedEntry[ numPassed ] = r.leafEntry;
+			passedItem[ numPassed ] = r.item;
+			passedKind[ numPassed ] = r.kind;
+			passedColor[ numPassed ] = r.filterColor;
+			passedShadow[ numPassed ] = r.filterShadow;
+			++numPassed;
+		}
+		if ( overflow ) {
+			status = GPU_HIT_OVERFLOW;
+			break;
+		}
+
+		/* apply the passed triangles that TraceLine() tests before the opaque one, in its order */
+		int order[ MAX_PASSED ];
+		for ( int i = 0; i < numPassed; ++i )
+		{
+			int j = i;
+			for ( ; j > 0 && TreeOrderLess( passedEntry[ i ], passedItem[ i ], passedEntry[ order[ j - 1 ] ], passedItem[ order[ j - 1 ] ] ); --j )
+				order[ j ] = order[ j - 1 ];
+			order[ j ] = i;
+		}
+
+		bool filterOpaque = false;
+		for ( int k = 0; k < numPassed; ++k )
+		{
+			const int i = order[ k ];
+			if ( opaque.test == TEST_OPAQUE && !TreeOrderLess( passedEntry[ i ], passedItem[ i ], opaque.leafEntry, opaque.item ) ) {
+				break;
+			}
+			const Info ti = pc.infos.i[ floatBitsToInt( pc.tris.t[ passedTri[ i ] ].v0Info.w ) ];
+			const uint siFlags = uint( ti.a.w );
+
+			/* don't double-trace against sky */
+			if ( ( compileFlags & siFlags & pc.skyFlag ) != 0 ) {
+				continue;
+			}
+
+			/* stack compile flags */
+			compileFlags |= siFlags;
+
+			if ( passedTest[ i ] == TEST_SKY ) {
+				if ( rLightSky != -1 && ti.b.x != -1 ) {
+					skyBits |= 1u << uint( ti.b.x );
+				}
+				continue;
+			}
+
+			/* alphashadow / lightfilter shader */
+			status |= GPU_HIT_FORCE_SUBSAMPLING;
+			if ( passedTest[ i ] != TEST_FILTER ) {
+				continue;
+			}
+			if ( ( passedKind[ i ] & GPU_INFO_FILTER_COLOR ) != 0 ) {
+				color *= passedColor[ i ];
+			}
+			if ( ( passedKind[ i ] & GPU_INFO_FILTER_SHADOW ) != 0 ) {
+				color *= passedShadow[ i ];
+			}
+
+			/* check filter for opaque */
+			if ( color.x <= 0.001 && color.y <= 0.001 && color.z <= 0.001 ) {
+				color = vec3( 0 );
+				hitDepth = passedDepth[ i ];
+				status |= GPU_HIT_DEPTH | GPU_HIT_OPAQUE;
+				filterOpaque = true;
+				break;
+			}
+		}
+
+		/* opaque triangle */
+		if ( !filterOpaque && opaque.test == TEST_OPAQUE ) {
+			compileFlags |= uint( pc.infos.i[ floatBitsToInt( pc.tris.t[ opaque.tri ].v0Info.w ) ].a.w );
+			hitDepth = opaque.depth;
+			color = vec3( 0 );
+			status |= GPU_HIT_DEPTH | GPU_HIT_OPAQUE;
+		}
+		break;
+	}
+	outColor = color;
+}
+
+void TraceRays(){
+	const uint index = gl_GlobalInvocationID.x;
+	if ( index >= pc.count ) {
+		return;
+	}
+
+	const Ray ray = pc.rays.r[ index ];
+	rOrigin = ray.originInhibit.xyz;
+	rInhibit = ray.originInhibit.w;
+	rEnd = ray.endDistance.xyz;
+	rDistance = ray.endDistance.w;
+	rDirection = ray.directionRecv.xyz;
+	rRecvShadows = floatBitsToInt( ray.directionRecv.w );
+	rLightSky = floatBitsToInt( ray.colorSky.w );
+	rSurfacesOffset = ray.misc.x;
+	rNumSurfaces = ray.misc.y;
+	rFlags = uint( ray.misc.z );
+
+	Hit hit;
+	vec3 hitPoint, color;
+	float hitDepth;
+	uint compileFlags, status, skyBits;
+	Trace( ray.colorSky.xyz, hitPoint, hitDepth, color, compileFlags, status, skyBits );
+	hit.hitDepth = vec4( hitPoint, hitDepth );
+	hit.color = vec4( color, 0 );
+	hit.misc = uvec4( compileFlags, status, skyBits, 0 );
+	pc.hits.h[ index ] = hit;
+}
+
+/* the neighbouring doubles (bit patterns +-1) */
+double NextBits( double x, int step ){
+	uvec2 bits = unpackDouble2x32( x );
+	if ( step > 0 ) {
+		bits.x += 1u;
+		if ( bits.x == 0u ) {
+			bits.y += 1u;
+		}
+	}
+	else
+	{
+		if ( bits.x == 0u ) {
+			bits.y -= 1u;
+		}
+		bits.x -= 1u;
+	}
+	return packDouble2x32( bits );
+}
+
+/* double sqrt and division rounded to nearest like the CPU's: the GPU's may be off by an ulp,
+   so the neighbours with a smaller remainder are taken */
+double SqrtRN( double x ){
+	precise double r = sqrt( x );
+	if ( !( x > 0 ) || isinf( x ) ) {
+		return r;
+	}
+	for ( int step = -1; step <= 1; step += 2 )
+	{
+		for ( ;; )
+		{
+			const double c = NextBits( r, step );
+			precise double remainderC = fma( -c, c, x );
+			precise double remainderR = fma( -r, r, x );
+			if ( abs( remainderC ) < abs( remainderR ) ) {
+				r = c;
+			}
+			else{
+				break;
+			}
+		}
+	}
+	return r;
+}
+
+double DivRN( double a, double b ){
+	precise double q = a / b;
+	if ( q == 0 || isinf( q ) || isnan( q ) ) {
+		return q;
+	}
+	for ( int step = -1; step <= 1; step += 2 )
+	{
+		for ( ;; )
+		{
+			const double c = NextBits( q, step );
+			precise double remainderC = fma( -c, b, a );
+			precise double remainderQ = fma( -q, b, a );
+			if ( abs( remainderC ) < abs( remainderQ ) ) {
+				q = c;
+			}
+			else{
+				break;
+			}
+		}
+	}
+	return q;
+}
+
+/* one ray of a sample, made like DirtForSample() / FloodLightForSample() do: the value it adds to the sample */
+void GatherRays(){
+	const uint index = gl_GlobalInvocationID.x;
+	const uint numVectors = pc.params.numVectors;
+	if ( index >= pc.params.numSamples * numVectors ) {
+		return;
+	}
+	const Sample luxel = pc.params.samples.s[ index / numVectors ];
+	const vec3 vector = pc.params.vectors.v[ index % numVectors ].xyz;
+	const float rayLength = pc.params.rayLength;
+
+	/* tangent space vector; trace->end = trace->origin + direction * depth */
+	precise vec3 direction = luxel.right.xyz * vector.x + luxel.up.xyz * vector.y + luxel.normal.xyz * vector.z;
+	precise vec3 end = luxel.origin.xyz + direction * rayLength;
+
+	/* SetupTrace(): VectorNormalize() works in double */
+	precise vec3 displacement = end - luxel.origin.xyz;
+	const dvec3 d = dvec3( displacement );
+	precise double lengthSquared = d.x * d.x + d.y * d.y + d.z * d.z;
+	const double length = SqrtRN( lengthSquared );
+
+	rOrigin = luxel.origin.xyz;
+	rEnd = end;
+	rDirection = length == 0 ? vec3( 0 ) : vec3( DivRN( d.x, length ), DivRN( d.y, length ), DivRN( d.z, length ) );
+	rDistance = float( length );
+	rInhibit = pc.params.inhibitRadius;
+	rRecvShadows = pc.params.recvShadows;
+	rLightSky = -1;
+	rSurfacesOffset = 0;
+	rNumSurfaces = pc.params.numSurfaces;
+	rFlags = GPU_RAY_TREE_ORDER | pc.params.rayFlags;
+	/* TraceLine()'s early outs */
+	if ( rRecvShadows == 0 || rDistance <= 0.00001 ) {
+		rFlags |= GPU_RAY_SKIP;
+	}
+
+	vec3 hitPoint, color;
+	float hitDepth;
+	uint compileFlags, status, skyBits;
+	Trace( vec3( 1 ), hitPoint, hitDepth, color, compileFlags, status, skyBits );
+
+	RayValue value;
+	value.value = 0;
+	value.flags = ( status & GPU_HIT_OVERFLOW ) != 0 ? GATHER_OVERFLOW : 0;
+	value.pad = 0;
+
+	/* trace->hit, and its distance: vector3_length() of a float vector, in double */
+	precise vec3 hit = ( status & GPU_HIT_POINT ) != 0 ? hitPoint : rOrigin;
+	if ( ( status & GPU_HIT_DEPTH ) != 0 ) {
+		hit = rOrigin + rDirection * hitDepth;
+	}
+	precise vec3 toHit = hit - rOrigin;
+	precise float hitSquared = Dot( toHit, toHit );
+	const double hitLength = SqrtRN( double( hitSquared ) );
+	const bool opaque = ( status & GPU_HIT_OPAQUE ) != 0;
+
+	if ( pc.params.mode == GATHER_DIRT ) {
+		/* gatherDirt += 1.0f - ooDepth * vector3_length( trace->hit - trace->origin ) */
+		if ( opaque ) {
+			precise double contribution = 1.0LF - double( pc.params.ooDepth ) * hitLength;
+			value.value = contribution;
+		}
+	}
+	else
+	{
+		float contribution = 1;
+		if ( ( compileFlags & ( pc.skyFlag | pc.params.translucentFlag ) ) != 0 ) {
+			contribution = 1;
+		}
+		else if ( opaque ) {
+			const float distance = float( hitLength );
+			/* float division, correctly rounded like the CPU's: in double */
+			const float ratio = float( DivRN( double( distance ), double( rayLength ) ) );
+			contribution = min( 1.0, ratio );
+		}
+		value.value = double( contribution );
+	}
+	pc.params.values.r[ index ] = value;
+}
+
+/* the sum of a sample's ray values, in the order the CPU adds them */
+void GatherReduce(){
+	const uint index = gl_GlobalInvocationID.x;
+	if ( index >= pc.params.numSamples ) {
+		return;
+	}
+	const uint numVectors = pc.params.numVectors;
+	precise float gather = 0;
+	uint flags = 0;
+	for ( uint i = 0; i < numVectors; ++i )
+	{
+		const RayValue value = pc.params.values.r[ index * numVectors + i ];
+		flags |= value.flags;
+		if ( pc.params.mode == GATHER_DIRT ) {
+			/* float += double */
+			precise double sum = double( gather ) + value.value;
+			gather = float( sum );
+		}
+		else{
+			gather += float( value.value );
+		}
+	}
+	GatherOut out_;
+	out_.gather = gather;
+	out_.flags = flags;
+	pc.params.outs.o[ index ] = out_;
+}
+
+void main(){
+	if ( pc.kernel == KERNEL_GATHER_RAYS ) {
+		GatherRays();
+	}
+	else if ( pc.kernel == KERNEL_GATHER_REDUCE ) {
+		GatherReduce();
+	}
+	else{
+		TraceRays();
+	}
+}

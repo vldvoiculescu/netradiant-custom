@@ -31,6 +31,7 @@
 /* dependencies */
 #include "q3map2.h"
 #include "bspfile_rbsp.h"
+#include "light_gpu.h"
 #include <set>
 
 
@@ -2688,6 +2689,18 @@ int LightMain( Args& args ){
 			Sys_Warning( "-embree: this q3map2 was built without Embree support, using the default ray tracer\n" );
 #endif
 		}
+		while ( args.takeArg( "-gpu" ) ) {
+#ifdef Q3MAP2_VULKAN
+			lightGpu = true;
+			Sys_Printf( "Tracing rays on the GPU where possible\n" );
+#ifdef Q3MAP2_EMBREE
+			/* the GPU repeats the -embree tracer: the rays left to the CPU use it too */
+			lightEmbree = true;
+#endif
+#else
+			Sys_Warning( "-gpu: this q3map2 was built without Vulkan support, using the CPU ray tracer\n" );
+#endif
+		}
 
 		while ( args.takeArg( "-nocollapse" ) ) {
 			noCollapse = true;
@@ -3058,6 +3071,7 @@ int LightMain( Args& args ){
 
 	/* light the world */
 	LightWorld( fastAllocate, bounceStore );
+	GpuShutdownTrace();
 
 	/* ydnar: export lightmaps */
 	if ( exportLightmaps && !externalLightmaps ) {

@@ -102,6 +102,13 @@ ifeq ($(Q3MAP2_EMBREE),yes)
 CPPFLAGS_EMBREE    ?= -DQ3MAP2_EMBREE
 LIBS_EMBREE        ?= -lembree4
 endif
+# optional Vulkan ray query GPU tracer for q3map2 -light -gpu: needs the Vulkan headers and glslangValidator
+# to build; the Vulkan loader (vulkan-1.dll / libvulkan.so.1) is loaded at run time, so it is not linked
+Q3MAP2_VULKAN      ?= no
+GLSLANG            ?= glslangValidator
+ifeq ($(Q3MAP2_VULKAN),yes)
+CPPFLAGS_VULKAN    ?= -DQ3MAP2_VULKAN
+endif
 CPPFLAGS_GL        ?=
 LIBS_GL            ?= -lGL # -lopengl32 on Win32
 CPPFLAGS_DL        ?=
@@ -503,7 +510,7 @@ binaries-mbspc: \
 
 .PHONY: clean
 clean:
-	$(FIND) . \( -name \*.o -o -name \*.d -o -name \*.$(DLL) -o -name \*.$(A) -o -name \*.$(EXE) \) -exec $(RM) {} \;
+	$(FIND) . \( -name \*.o -o -name \*.d -o -name \*.$(DLL) -o -name \*.$(A) -o -name \*.$(EXE) -o -name \*.spv.h \) -exec $(RM) {} \;
 	$(RM_R) $(INSTALLDIR_BASE)/
 	$(RM) icons/*.rc
 
@@ -551,7 +558,7 @@ $(INSTALLDIR)/q3map2.$(EXE): LDFLAGS_EXTRA += -Wl,-rpath '-Wl,$$ORIGIN'
 endif
 endif
 $(INSTALLDIR)/q3map2.$(EXE): LIBS_EXTRA := $(LIBS_XML) $(LIBS_GLIB) $(LIBS_PNG) $(LIBS_JPEG) $(LIBS_ZLIB) $(LIBS_ASSIMP) $(LIBS_EMBREE)
-$(INSTALLDIR)/q3map2.$(EXE): CPPFLAGS_EXTRA := $(CPPFLAGS_XML) $(CPPFLAGS_GLIB) $(CPPFLAGS_PNG) $(CPPFLAGS_JPEG) -Itools/quake3/common -Ilibs -Iinclude $(CPPFLAGS_ASSIMP) $(CPPFLAGS_EMBREE)
+$(INSTALLDIR)/q3map2.$(EXE): CPPFLAGS_EXTRA := $(CPPFLAGS_XML) $(CPPFLAGS_GLIB) $(CPPFLAGS_PNG) $(CPPFLAGS_JPEG) -Itools/quake3/common -Ilibs -Iinclude $(CPPFLAGS_ASSIMP) $(CPPFLAGS_EMBREE) $(CPPFLAGS_VULKAN)
 $(INSTALLDIR)/q3map2.$(EXE): \
 	tools/quake3/common/cmdlib.o \
 	tools/quake3/common/qimagelib.o \
@@ -585,6 +592,7 @@ $(INSTALLDIR)/q3map2.$(EXE): \
 	tools/quake3/q3map2/image.o \
 	tools/quake3/q3map2/leakfile.o \
 	tools/quake3/q3map2/light_bounce.o \
+	tools/quake3/q3map2/light_gpu.o \
 	tools/quake3/q3map2/lightmaps_ydnar.o \
 	tools/quake3/q3map2/light.o \
 	tools/quake3/q3map2/light_trace.o \
@@ -617,6 +625,13 @@ $(INSTALLDIR)/q3map2.$(EXE): \
 	libwebplib.$(A) \
 	$(if $(findstring Win32,$(OS)),icons/q3map2.o,) \
 	| $(if $(findstring yes,$(ASSIMP_INTERNAL)),$(INSTALLDIR)/libassimp_.$(DLL),) \
+
+ifeq ($(Q3MAP2_VULKAN),yes)
+# the -gpu compute shader, compiled to SPIR-V and embedded in q3map2 as a C array
+tools/quake3/q3map2/light_gpu.o: tools/quake3/q3map2/light_gpu_trace.spv.h
+tools/quake3/q3map2/light_gpu_trace.spv.h: tools/quake3/q3map2/light_gpu_trace.comp
+	$(GLSLANG) -V --target-env vulkan1.2 --vn light_gpu_trace_spv -o $@ $<
+endif
 
 libmathlib.$(A): CPPFLAGS_EXTRA := -Ilibs
 libmathlib.$(A): \

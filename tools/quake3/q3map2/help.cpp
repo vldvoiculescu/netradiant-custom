@@ -214,6 +214,7 @@ static void HelpLight()
 		{ "-filter", "Lightmap filtering" },
 		{ "-floodlight", "Enable floodlight (zero-effort somewhat decent lighting)" },
 		{ "-gamma <F>", "Lightmap gamma" },
+		{ "-gpu", "Trace rays on a GPU with Vulkan ray tracing (needs a q3map2 built with Q3MAP2_VULKAN=yes, falls back to the CPU): faster, nearly identical result; currently dirt and floodlight" },
 		{ "-gridambientdirectionality <F>", "Ambient directional lighting received (default: 0.0)" },
 		{ "-gridambientscale <F>", "Scaling factor for the light grid ambient components only" },
 		{ "-griddirectionality <F>", "Directional lighting received (default: 1.0)" },

@@ -30,6 +30,8 @@
 
 /* dependencies */
 #include "q3map2.h"
+#include "light_gpu.h"
+#include <map>
 #include <chrono>
 #include <atomic>
 #if defined( __x86_64__ ) || defined( __i386__ )
@@ -1076,6 +1078,12 @@ static void PopulateTraceNodes(){
 #ifdef Q3MAP2_EMBREE
 static void SetupEmbree();
 #endif
+#ifdef Q3MAP2_VULKAN
+namespace
+{
+void SetupGpu();
+}
+#endif
 
 void SetupTraceNodes(){
 	/* note it */
@@ -1124,6 +1132,11 @@ void SetupTraceNodes(){
 #ifdef Q3MAP2_EMBREE
 	if ( lightEmbree ) {
 		SetupEmbree();
+	}
+#endif
+#ifdef Q3MAP2_VULKAN
+	if ( lightGpu ) {
+		SetupGpu();
 	}
 #endif
 
@@ -2230,56 +2243,352 @@ static void TraceLineEmbree( trace_t *trace ){
 	}
 }
 
-/* Q3MAP2_DEBUG_EMBREE_CHECK: counts how the -embree result differs from TraceLine_r()'s */
-static void EmbreeCheck( const trace_t& reference, const trace_t& trace ){
-	enum { Rays, OpaqueOnlyEmbree, OpaqueOnlyTree, Color, Flags, Sky, ForceSubsampling, HitDistance, LitOnlyEmbree, LitOnlyTree, LitOnlyTreeFullNodes, Count };
-	static std::atomic<long long> counts[ Count ];
-	static std::atomic<int> printed;
-	static const struct Report {
-		~Report(){
-			fprintf( stderr, "embree check: %lld rays; lit only with embree %lld, only with tree %lld (%lld with full node list); opaque only with embree %lld, only with tree %lld; color %lld; compile flags %lld; sky %lld; forceSubsampling %lld; hit distance %lld\n",
-			         counts[ Rays ].load(), counts[ LitOnlyEmbree ].load(), counts[ LitOnlyTree ].load(), counts[ LitOnlyTreeFullNodes ].load(), counts[ OpaqueOnlyEmbree ].load(), counts[ OpaqueOnlyTree ].load(), counts[ Color ].load(),
+#endif
+
+/* debugging aid: counts how the results of a tracer differ from the reference tracer's,
+   printed at exit (Q3MAP2_DEBUG_EMBREE_CHECK, Q3MAP2_DEBUG_GPU_CHECK) */
+namespace
+{
+struct TraceChecker
+{
+	enum { Rays, OpaqueOnlyTested, OpaqueOnlyReference, Color, Flags, Sky, ForceSubsampling, HitDistance, LitOnlyTested, LitOnlyReference, LitOnlyReferenceFullNodes, Count };
+	const char *name, *referenceName;
+	std::atomic<long long> counts[ Count ] = {};
+	std::atomic<int> printed = 0;
+
+	TraceChecker( const char *name, const char *referenceName ) : name( name ), referenceName( referenceName ){
+	}
+	~TraceChecker(){
+		if ( counts[ Rays ] != 0 ) {
+			fprintf( stderr, "%s check: %lld rays; lit only with %s %lld, only with %s %lld (%lld with full node list); opaque only with %s %lld, only with %s %lld; color %lld; compile flags %lld; sky %lld; forceSubsampling %lld; hit distance %lld\n",
+			         name, counts[ Rays ].load(), name, counts[ LitOnlyTested ].load(), referenceName, counts[ LitOnlyReference ].load(), counts[ LitOnlyReferenceFullNodes ].load(),
+			         name, counts[ OpaqueOnlyTested ].load(), referenceName, counts[ OpaqueOnlyReference ].load(), counts[ Color ].load(),
 			         counts[ Flags ].load(), counts[ Sky ].load(), counts[ ForceSubsampling ].load(), counts[ HitDistance ].load() );
 		}
-	} report;
+	}
 
-	++counts[ Rays ];
+	void check( const trace_t& reference, const trace_t& trace ){
+		++counts[ Rays ];
 
-	/* what the caller makes of it: sun / sky light (testAll) needs to reach the sky */
-	const auto lit = []( const trace_t& t ){
-		return !t.opaque && ( !t.testAll || ( t.compileFlags & C_SKY ) );
-	};
-	if ( lit( trace ) != lit( reference ) ) {
-		++counts[ lit( trace ) ? LitOnlyEmbree : LitOnlyTree ];
-		if ( !lit( trace ) && reference.numTestNodes >= MAX_TRACE_TEST_NODES ) {
-			++counts[ LitOnlyTreeFullNodes ];
+		/* what the caller makes of it: sun / sky light (testAll) needs to reach the sky */
+		const auto lit = []( const trace_t& t ){
+			return !t.opaque && ( !t.testAll || ( t.compileFlags & C_SKY ) );
+		};
+		if ( lit( trace ) != lit( reference ) ) {
+			++counts[ lit( trace ) ? LitOnlyTested : LitOnlyReference ];
+			if ( !lit( trace ) && reference.numTestNodes >= MAX_TRACE_TEST_NODES ) {
+				++counts[ LitOnlyReferenceFullNodes ];
+			}
+			if ( printed++ < 12 ) {
+				fprintf( stderr, "%s check lit only with %s: origin ( %g %g %g ) end ( %g %g %g ) testAll %d; %s opaque %d hit %g flags %x; %s opaque %d hit %g flags %x\n",
+				         name, lit( trace ) ? name : referenceName, reference.origin[ 0 ], reference.origin[ 1 ], reference.origin[ 2 ], reference.end[ 0 ], reference.end[ 1 ], reference.end[ 2 ], reference.testAll,
+				         referenceName, reference.opaque, vector3_length( reference.hit - reference.origin ), reference.compileFlags,
+				         name, trace.opaque, vector3_length( trace.hit - trace.origin ), trace.compileFlags );
+			}
 		}
-		if ( printed++ < 12 ) {
-			fprintf( stderr, "embree check lit only with %s: origin ( %g %g %g ) end ( %g %g %g ) testAll %d; tree opaque %d hit %g flags %x; embree opaque %d hit %g flags %x\n",
-			         lit( trace ) ? "embree" : "tree", reference.origin[ 0 ], reference.origin[ 1 ], reference.origin[ 2 ], reference.end[ 0 ], reference.end[ 1 ], reference.end[ 2 ], reference.testAll,
-			         reference.opaque, vector3_length( reference.hit - reference.origin ), reference.compileFlags,
-			         trace.opaque, vector3_length( trace.hit - trace.origin ), trace.compileFlags );
+		if ( trace.opaque != reference.opaque ) {
+			++counts[ trace.opaque ? OpaqueOnlyTested : OpaqueOnlyReference ];
+			return;
+		}
+		if ( trace.color != reference.color ) {
+			++counts[ Color ];
+		}
+		if ( trace.compileFlags != reference.compileFlags ) {
+			++counts[ Flags ];
+		}
+		if ( memcmp( trace.skyIndices, reference.skyIndices, sizeof( trace.skyIndices ) ) ) {
+			++counts[ Sky ];
+		}
+		if ( trace.forceSubsampling != reference.forceSubsampling ) {
+			++counts[ ForceSubsampling ];
+		}
+		if ( trace.opaque && std::fabs( vector3_length( trace.hit - trace.origin ) - vector3_length( reference.hit - reference.origin ) ) > 0.01f ) {
+			++counts[ HitDistance ];
 		}
 	}
-	if ( trace.opaque != reference.opaque ) {
-		++counts[ trace.opaque ? OpaqueOnlyEmbree : OpaqueOnlyTree ];
-		return;
+};
+}
+
+#ifdef Q3MAP2_EMBREE
+/* Q3MAP2_DEBUG_EMBREE_CHECK: counts how the -embree result differs from TraceLine_r()'s */
+static void EmbreeCheck( const trace_t& reference, const trace_t& trace ){
+	static TraceChecker checker( "embree", "tree" );
+	checker.check( reference, trace );
+}
+#endif
+
+
+
+#ifdef Q3MAP2_VULKAN
+/* -------------------------------------------------------------------------------
+
+   -gpu: the trace triangles and nodes for the GPU (light_gpu.cpp), and rays traced in batches.
+   the GPU repeats TraceLineEmbree(): the same enlarged triangles, TestTraceTriangle() and
+   RayPassesLeaf() tests, tree order for rays without a light, solid space from the bsp nodes.
+
+   ------------------------------------------------------------------------------- */
+
+namespace
+{
+bool gpuReady = false;
+std::atomic<long long> gpuOverflowRays;
+
+struct GpuSceneBuilder
+{
+	GpuScene& scene;
+	std::vector<int> parents;
+
+	/* adds the triangles in the leaves, like CollectTraceTriangles_r() */
+	void collect( int nodeNum ){
+		if ( nodeNum < 0 || nodeNum >= numTraceNodes ) {
+			return;
+		}
+		const traceNode_t& node = traceNodes[ nodeNum ];
+		if ( node.type >= 0 ) {
+			parents[ node.children[ 0 ] ] = nodeNum;
+			parents[ node.children[ 1 ] ] = nodeNum;
+			collect( node.children[ 0 ] );
+			collect( node.children[ 1 ] );
+			return;
+		}
+		if ( node.type != TRACE_LEAF || node.numItems == 0 ) {
+			return;
+		}
+
+		/* the path from the root to the leaf: RayPassesLeaf() */
+		const int pathOffset = int( scene.paths.size() );
+		for ( int child = nodeNum, n = parents[ nodeNum ]; n >= 0; child = n, n = parents[ n ] )
+			scene.paths.push_back( uint32_t( n ) | ( traceNodes[ n ].children[ 0 ] == child ? 0u : 1u << 31 ) );
+		std::reverse( scene.paths.begin() + pathOffset, scene.paths.end() );
+		const int pathLength = int( scene.paths.size() ) - pathOffset;
+
+		for ( int i = 0; i < node.numItems; ++i )
+		{
+			const traceTriangle_t& tt = traceTriangles[ node.items[ i ] ];
+			GpuTriangle& t = scene.triangles.emplace_back();
+			for ( int j = 0; j < 3; ++j )
+			{
+				t.v0[ j ] = tt.v[ 0 ].xyz[ j ];
+				t.edge1[ j ] = tt.edge1[ j ];
+				t.edge2[ j ] = tt.edge2[ j ];
+				t.st[ j ][ 0 ] = tt.v[ j ].st[ 0 ];
+				t.st[ j ][ 1 ] = tt.v[ j ].st[ 1 ];
+			}
+			t.info = tt.infoNum;
+			t.pathOffset = pathOffset;
+			t.pathLength = pathLength;
+			t.item = i;
+			t.pad = 0;
+
+			/* enlarged like the embree triangles */
+			const Vector3 center = ( tt.v[ 0 ].xyz + tt.v[ 1 ].xyz + tt.v[ 2 ].xyz ) * ( 1.0f / 3.0f );
+			for ( int j = 0; j < 3; ++j )
+			{
+				const Vector3 xyz = center + ( tt.v[ j ].xyz - center ) * 1.06f;
+				scene.vertices.insert( scene.vertices.end(), { xyz[ 0 ], xyz[ 1 ], xyz[ 2 ] } );
+			}
+		}
 	}
-	if ( trace.color != reference.color ) {
-		++counts[ Color ];
+};
+
+/* builds the GPU scene after SetupTraceNodes() */
+void SetupGpu(){
+	Sys_Printf( "--- SetupGpu ---\n" );
+
+	GpuScene scene;
+	GpuSceneBuilder builder{ scene, std::vector<int>( numTraceNodes, -1 ) };
+	builder.collect( headNodeNum );
+
+	for ( int i = 0; i < numTraceNodes; ++i )
+	{
+		const traceNode_t& node = traceNodes[ i ];
+		GpuNode& n = scene.nodes.emplace_back();
+		n.normal[ 0 ] = node.plane.normal()[ 0 ];
+		n.normal[ 1 ] = node.plane.normal()[ 1 ];
+		n.normal[ 2 ] = node.plane.normal()[ 2 ];
+		n.dist = node.plane.dist();
+		n.type = node.type;
+		n.children[ 0 ] = node.children[ 0 ];
+		n.children[ 1 ] = node.children[ 1 ];
+		n.numItems = node.numItems;
 	}
-	if ( trace.compileFlags != reference.compileFlags ) {
-		++counts[ Flags ];
+
+	std::map<const image_t*, int> imageOffsets;
+	for ( int i = 0; i < numTraceInfos; ++i )
+	{
+		const traceInfo_t& ti = traceInfos[ i ];
+		const shaderInfo_t *si = ti.si;
+		GpuInfo& info = scene.infos.emplace_back();
+		info.castShadows = ti.castShadows;
+		info.surfaceNum = ti.surfaceNum;
+		info.skipGrid = ti.skipGrid;
+		info.compileFlags = si->compileFlags;
+		info.skyIndex = si->skyIndex;
+		info.imageOffset = 0;
+		info.imageSize = 0;
+		/* TestTraceTriangle() */
+		if ( si->compileFlags & C_SKY ) {
+			info.kind = GPU_INFO_SKY;
+		}
+		else if ( !( si->compileFlags & ( C_ALPHASHADOW | C_LIGHTFILTER ) ) || si->lightImage == nullptr || si->lightImage->pixels == nullptr ) {
+			info.kind = GPU_INFO_OPAQUE;
+		}
+		else
+		{
+			const image_t *image = si->lightImage;
+			info.kind = GPU_INFO_FILTER | ( ( si->compileFlags & C_LIGHTFILTER ) ? GPU_INFO_FILTER_COLOR : 0 ) | ( ( si->compileFlags & C_ALPHASHADOW ) ? GPU_INFO_FILTER_SHADOW : 0 );
+			if ( image->width > 0xffff || image->height > 0xffff ) {
+				Error( "-gpu: image %s is too large", image->name.c_str() );
+			}
+			const auto [ it, added ] = imageOffsets.emplace( image, int( scene.images.size() ) );
+			if ( added ) {
+				const size_t texels = size_t( image->width ) * image->height;
+				scene.images.resize( scene.images.size() + texels );
+				memcpy( scene.images.data() + it->second, image->pixels, texels * 4 );
+			}
+			info.imageOffset = it->second;
+			info.imageSize = image->width << 16 | image->height;
+		}
 	}
-	if ( memcmp( trace.skyIndices, reference.skyIndices, sizeof( trace.skyIndices ) ) ) {
-		++counts[ Sky ];
+
+	scene.headNode = headNodeNum;
+	scene.numBspNodes = numBspTraceNodes;
+	scene.skyFlag = C_SKY;
+
+	gpuReady = GpuSetup( scene );
+}
+}
+
+bool GpuTraceEnabled(){
+	return gpuReady;
+}
+
+void GpuTraceBatch::add( const trace_t& trace ){
+	GpuRay& ray = m_rays.emplace_back();
+	for ( int j = 0; j < 3; ++j )
+	{
+		ray.origin[ j ] = trace.origin[ j ];
+		ray.end[ j ] = trace.end[ j ];
+		ray.direction[ j ] = trace.direction[ j ];
+		ray.color[ j ] = trace.color[ j ];
 	}
-	if ( trace.forceSubsampling != reference.forceSubsampling ) {
-		++counts[ ForceSubsampling ];
+	ray.inhibitRadius = trace.inhibitRadius;
+	ray.distance = trace.distance;
+	ray.recvShadows = trace.recvShadows;
+	ray.lightSkyIndex = !g_oneSky && trace.light != nullptr ? trace.light->skyIndex : -1;
+
+	if ( trace.surfaces != m_lastSurfaces || trace.numSurfaces != m_lastNumSurfaces ) {
+		m_lastSurfaces = trace.surfaces;
+		m_lastNumSurfaces = trace.numSurfaces;
+		m_lastOffset = int( m_surfaces.size() );
+		m_surfaces.insert( m_surfaces.end(), trace.surfaces, trace.surfaces + trace.numSurfaces );
 	}
-	if ( trace.opaque && std::fabs( vector3_length( trace.hit - trace.origin ) - vector3_length( reference.hit - reference.origin ) ) > 0.01f ) {
-		++counts[ HitDistance ];
+	ray.surfacesOffset = m_lastOffset;
+	ray.numSurfaces = trace.numSurfaces;
+
+	/* debugging aid: env Q3MAP2_DEBUG_GPU_NEAREST traces rays without a light to the nearest opaque triangle */
+	static const bool nearest = getenv( "Q3MAP2_DEBUG_GPU_NEAREST" ) != nullptr;
+	ray.flags = ( trace.testAll ? GPU_RAY_TEST_ALL : 0 )
+	          | ( trace.light == nullptr && !nearest ? GPU_RAY_TREE_ORDER : 0 )
+	          | ( inGrid ? GPU_RAY_IN_GRID : 0 )
+	          | ( noSurfaces ? GPU_RAY_NO_SURFACES : 0 )
+	          /* TraceLine()'s early outs */
+	          | ( !trace.recvShadows || !trace.testOcclusion || trace.distance <= 0.00001f ? GPU_RAY_SKIP : 0 );
+	ray.pad = 0;
+}
+
+void GpuTraceBatch::run(){
+	m_hits.resize( m_rays.size() );
+	GpuTrace( m_rays.data(), m_hits.data(), m_rays.size(), m_surfaces.data(), m_surfaces.size() );
+	m_next = 0;
+}
+
+void GpuTraceBatch::apply( trace_t *trace ){
+	const GpuRay& ray = m_rays[ m_next ];
+	const GpuHit& hit = m_hits[ m_next ];
+	++m_next;
+
+	/* the ray as added */
+	trace->origin = Vector3( ray.origin[ 0 ], ray.origin[ 1 ], ray.origin[ 2 ] );
+	trace->end = Vector3( ray.end[ 0 ], ray.end[ 1 ], ray.end[ 2 ] );
+	SetupTrace( trace );
+	trace->color = Vector3( ray.color[ 0 ], ray.color[ 1 ], ray.color[ 2 ] );
+
+	/* debugging aid: env Q3MAP2_DEBUG_GPU_CHECK compares each ray with the CPU tracer's result */
+	static const bool check = getenv( "Q3MAP2_DEBUG_GPU_CHECK" ) != nullptr;
+	trace_t reference;
+	if ( check ) {
+		reference = *trace;
+		TraceLine( &reference );
 	}
+
+	if ( hit.status & GPU_HIT_OVERFLOW ) {
+		++gpuOverflowRays;
+		TraceLine( trace );
+	}
+	else
+	{
+		/* TraceLineInner() */
+		trace->passSolid = hit.status & GPU_HIT_PASS_SOLID;
+		trace->opaque = hit.status & GPU_HIT_OPAQUE;
+		trace->compileFlags = hit.compileFlags;
+		memset( trace->skyIndices, 0, sizeof( trace->skyIndices ) );
+		for ( int i = 0; i < MAX_SKIES; ++i )
+		{
+			if ( hit.skyBits & ( 1u << i ) ) {
+				bit_enable( trace->skyIndices, i );
+			}
+		}
+		trace->numTestNodes = 0;
+		if ( hit.status & GPU_HIT_POINT ) {
+			trace->hit = Vector3( hit.hit[ 0 ], hit.hit[ 1 ], hit.hit[ 2 ] );
+		}
+		if ( hit.status & GPU_HIT_DEPTH ) {
+			trace->hit = trace->origin + trace->direction * hit.depth;
+		}
+		if ( hit.status & GPU_HIT_FORCE_SUBSAMPLING ) {
+			trace->forceSubsampling = 1;
+		}
+		trace->color = Vector3( hit.color[ 0 ], hit.color[ 1 ], hit.color[ 2 ] );
+	}
+
+	if ( check ) {
+		static TraceChecker checker( "gpu", lightEmbree ? "embree" : "tree" );
+		checker.check( reference, *trace );
+	}
+}
+
+void GpuTraceBatch::clear(){
+	m_rays.clear();
+	m_hits.clear();
+	m_surfaces.clear();
+	m_lastSurfaces = nullptr;
+	m_lastNumSurfaces = -1;
+	m_lastOffset = 0;
+	m_next = 0;
+}
+
+void GpuShutdownTrace(){
+	if ( gpuReady ) {
+		Sys_Printf( "%9lld GPU rays traced on the CPU (too complex for the shader)\n", gpuOverflowRays.load() );
+		GpuShutdown();
+		gpuReady = false;
+	}
+}
+#else
+bool GpuTraceEnabled(){
+	return false;
+}
+void GpuTraceBatch::add( const trace_t& ){
+}
+void GpuTraceBatch::run(){
+}
+void GpuTraceBatch::apply( trace_t *trace ){
+	TraceLine( trace );
+}
+void GpuTraceBatch::clear(){
+}
+void GpuShutdownTrace(){
 }
 #endif
 
