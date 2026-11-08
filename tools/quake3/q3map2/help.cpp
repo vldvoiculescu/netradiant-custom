@@ -220,6 +220,7 @@ static void HelpLight()
 		{ "-gridscale <F>", "Scaling factor for the light grid only" },
 		{ "-lightanglehl 0", "Disable half lambert light angle attenuation" },
 		{ "-lightanglehl 1", "Enable half lambert light angle attenuation" },
+		{ "-lightcull", "Only compute the lightmap tiles each light can reach: much faster with many lights, e.g. -bounce (same output)" },
 		{ "-lightmapdir <directory>", "Directory to store external lightmaps (default: same as map name without extension)" },
 		{ "-lightmapsearchblocksize <N>", "Restricted lightmap searching - block size" },
 		{ "-lightmapsearchpower <N>", "Restricted lightmap searching - merge power" },

@@ -2117,6 +2117,136 @@ static const size_t splitWorkMinRowLuxels = 64 * 64;
 static const size_t splitWorkMemoryBudget = size_t( 1 ) << 30;
 static std::atomic<size_t> splitWorkMemoryInUse{ 0 };
 
+/* -lightcull: a rectangle of luxels, x0 <= x < x1, y0 <= y < y1 */
+struct LuxelRect
+{
+	int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+	bool empty() const {
+		return x1 <= x0 || y1 <= y0;
+	}
+};
+
+/* -lightcull: a raw lightmap split into tiles of luxels, with bounds of where the luxels sample light */
+struct LightTiles
+{
+	static const int size = 16;
+	int tilesW, tilesH;
+	std::vector<MinMax> bounds;                  /* mapped luxel origins */
+	std::vector<float> reach;                    /* how far supersamples get from their luxel origin */
+	std::vector<int> mapped;                     /* number of mapped luxels */
+};
+
+/* -lightcull: the tiles of a raw lightmap a light may reach */
+struct LightRegion
+{
+	std::vector<int> tiles;
+	LuxelRect rect;                             /* luxels of those tiles */
+};
+
+/*
+   SetupLightTiles()
+   -lightcull: supersampling (SubsampleRawLuxel_r) moves samples from the luxel origin towards its mapped
+   neighbors, by at most 2 * 0.25 * lightSamplesSearchBoxSize of each neighbor vector in total
+ */
+
+static void SetupLightTiles( const rawLightmap_t *lm, LightTiles& tiles ){
+	tiles.tilesW = ( lm->sw + LightTiles::size - 1 ) / LightTiles::size;
+	tiles.tilesH = ( lm->sh + LightTiles::size - 1 ) / LightTiles::size;
+	const int numTiles = tiles.tilesW * tiles.tilesH;
+	tiles.bounds.assign( numTiles, MinMax() );
+	tiles.reach.assign( numTiles, 0 );
+	tiles.mapped.assign( numTiles, 0 );
+	for ( int y = 0; y < lm->sh; ++y )
+	{
+		for ( int x = 0; x < lm->sw; ++x )
+		{
+			if ( lm->getSuperCluster( x, y ) < CLUSTER_NORMAL ) {
+				continue;
+			}
+			const int t = ( y / LightTiles::size ) * tiles.tilesW + x / LightTiles::size;
+			const Vector3& origin = lm->getSuperOrigin( x, y );
+			tiles.bounds[ t ].extend( origin );
+			tiles.mapped[ t ]++;
+
+			double neighbor = 0;
+			const int dirs[ 4 ][ 2 ] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+			for ( const auto& d : dirs )
+			{
+				const int nx = x + d[ 0 ], ny = y + d[ 1 ];
+				if ( nx >= 0 && nx < lm->sw && ny >= 0 && ny < lm->sh && lm->getSuperCluster( nx, ny ) >= CLUSTER_NORMAL ) {
+					neighbor = std::max( neighbor, double( vector3_length( lm->getSuperOrigin( nx, ny ) - origin ) ) );
+				}
+			}
+			value_maximize( tiles.reach[ t ], float( neighbor * lightSamplesSearchBoxSize * 1.01 + 0.01 ) );
+		}
+	}
+}
+
+/*
+   LightRegionFor()
+   -lightcull: the tiles where the light may give light. LightContributionToSample() returns 0, before doing
+   anything else, for samples at or beyond the envelope of point, spot and area lights
+ */
+
+static void LightRegionFor( const LightTiles& tiles, const rawLightmap_t *lm, const light_t *light, LightRegion& region ){
+	region.tiles.clear();
+	region.rect = LuxelRect{ lm->sw, lm->sh, 0, 0 };
+	for ( int t = 0; t < tiles.tilesW * tiles.tilesH; ++t )
+	{
+		if ( tiles.mapped[ t ] == 0 ) {
+			continue;
+		}
+		if ( light->type != ELightType::Sun ) {
+			double distance2 = 0;
+			for ( int i = 0; i < 3; ++i )
+			{
+				const double e = std::max( { 0.0, double( tiles.bounds[ t ].mins[ i ] ) - light->origin[ i ], double( light->origin[ i ] ) - tiles.bounds[ t ].maxs[ i ] } );
+				distance2 += e * e;
+			}
+			if ( std::sqrt( distance2 ) - tiles.reach[ t ] >= double( light->envelope ) + 1.0 ) {
+				continue;
+			}
+		}
+		region.tiles.push_back( t );
+		const int tx = t % tiles.tilesW, ty = t / tiles.tilesW;
+		region.rect.x0 = std::min( region.rect.x0, tx * LightTiles::size );
+		region.rect.y0 = std::min( region.rect.y0, ty * LightTiles::size );
+		region.rect.x1 = std::max( region.rect.x1, std::min( lm->sw, ( tx + 1 ) * LightTiles::size ) );
+		region.rect.y1 = std::max( region.rect.y1, std::min( lm->sh, ( ty + 1 ) * LightTiles::size ) );
+	}
+}
+
+/*
+   ResetLightLuxels()
+   -lightcull: puts luxels of a per-light buffer back to the state the initial pass leaves luxels without light in
+ */
+
+static void ResetLightLuxels( const rawLightmap_t *lm, rawLightmap_t& tmplm, const LuxelRect& rect, bool splitRows ){
+	if ( rect.empty() ) {
+		return;
+	}
+	ParallelFor( splitRows ? rect.y1 - rect.y0 : 1, [&]( int task ){
+		const int y0 = splitRows ? rect.y0 + task : rect.y0, y1 = splitRows ? y0 + 1 : rect.y1;
+		for ( int y = y0; y < y1; ++y )
+		{
+			for ( int x = rect.x0; x < rect.x1; ++x )
+			{
+				SuperLuxel& luxel = tmplm.getSuperLuxel( 0, x, y );
+				luxel.value.set( 0 );
+				luxel.count = lm->getSuperCluster( x, y ) >= CLUSTER_NORMAL ? 1 : 0;
+				if ( deluxemap ) {
+					tmplm.getSuperDeluxel( x, y ).set( 0 );
+				}
+				if ( lightSamples > 1 || lightRandomSamples ) {
+					tmplm.getSuperFlag( x, y ) = 0;
+				}
+			}
+		}
+	} );
+}
+
+
+
 /*
    IlluminateRawLightmapLight()
    computes one light's contribution to a raw lightmap: the initial one-sample-per-luxel pass and
@@ -2126,83 +2256,113 @@ static std::atomic<size_t> splitWorkMemoryInUse{ 0 };
    splitRows (-splitwork) also spreads this one light over threads, with identical results:
    the initial pass in independent blocks of rows, the supersampling pass as a wavefront
    (each row trails the row above by two 2x2 stamps, so overlapping stamps keep their original order).
+   region (-lightcull) limits the work to the tiles the light may reach: the luxels outside them get no light
+   and stay as they are; dirty tracks the luxels changed for the previous light, which are reset first.
  */
 
-static int IlluminateRawLightmapLight( rawLightmap_t *lm, rawLightmap_t& tmplm, trace_t& trace, bool splitRows ){
+static int IlluminateRawLightmapLight( rawLightmap_t *lm, rawLightmap_t& tmplm, trace_t& trace, bool splitRows, const LightRegion *region = nullptr, const LightTiles *tiles = nullptr, LuxelRect *dirty = nullptr ){
 	const float tests[ 4 ][ 2 ] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
 
 	/* initial pass, one sample per luxel */
 	std::atomic<int> totalLighted{ 0 };
-	const int rowsPerBlock = splitRows ? std::max( 1, 1024 / std::max( lm->sw, 1 ) ) : std::max( lm->sh, 1 );
-	ParallelFor( ( lm->sh + rowsPerBlock - 1 ) / rowsPerBlock, [&]( int block ){
-		const int y0 = block * rowsPerBlock, y1 = std::min( lm->sh, ( block + 1 ) * rowsPerBlock );
-
-		/* setup */
-		const size_t first = size_t( y0 ) * lm->sw, count = size_t( y1 - y0 ) * lm->sw;
-		memset( tmplm.superLuxels[0] + first, 0, count * sizeof( *lm->superLuxels[0] ) );
-		if ( deluxemap ) {
-			memset( tmplm.superDeluxels + first, 0, count * sizeof( *lm->superDeluxels ) );
-		}
-		if ( lightSamples > 1 || lightRandomSamples ) {
-			memset( tmplm.superFlags + first, 0, count * sizeof( *lm->superFlags ) );
+	const auto luxelPass = [&]( int x, int y, trace_t& blockTrace, int& lighted ){
+		/* get cluster */
+		const int cluster = lm->getSuperCluster( x, y );
+		if ( cluster < CLUSTER_NORMAL ) {
+			return;
 		}
 
-		trace_t blockTrace = trace;
-		int lighted = 0;
-		for ( int y = y0; y < y1; ++y )
-		{
-			for ( int x = 0; x < lm->sw; ++x )
-			{
-				/* get cluster */
-				const int cluster = lm->getSuperCluster( x, y );
-				if ( cluster < CLUSTER_NORMAL ) {
-					continue;
-				}
-
-				/* get particulars */
-				SuperLuxel& lightLuxel = tmplm.getSuperLuxel( 0, x, y );
+		/* get particulars */
+		SuperLuxel& lightLuxel = tmplm.getSuperLuxel( 0, x, y );
 
 	#if 0
-				////////// 27's temp hack for testing edge clipping ////
-				if ( lm->getSuperOrigin( x, y ) == g_vector3_identity ) {
-					lightLuxel.value[ 1 ] = 255;
-					lightLuxel.count = 1;
-					lighted++;
-				}
-				else
+		////////// 27's temp hack for testing edge clipping ////
+		if ( lm->getSuperOrigin( x, y ) == g_vector3_identity ) {
+			lightLuxel.value[ 1 ] = 255;
+			lightLuxel.count = 1;
+			lighted++;
+		}
+		else
 	#endif
-				{
-					/* set contribution count */
-					lightLuxel.count = 1;
+		{
+			/* set contribution count */
+			lightLuxel.count = 1;
 
-					/* setup trace */
-					blockTrace.cluster = cluster;
-					blockTrace.origin = lm->getSuperOrigin( x, y );
-					blockTrace.normal = lm->getSuperNormal( x, y );
+			/* setup trace */
+			blockTrace.cluster = cluster;
+			blockTrace.origin = lm->getSuperOrigin( x, y );
+			blockTrace.normal = lm->getSuperNormal( x, y );
 
-					/* get light for this sample */
-					LightContributionToSample( &blockTrace );
-					lightLuxel.value = blockTrace.color;
+			/* get light for this sample */
+			LightContributionToSample( &blockTrace );
+			lightLuxel.value = blockTrace.color;
 
-					/* add the contribution to the deluxemap */
-					if ( deluxemap ) {
-						tmplm.getSuperDeluxel( x, y ) = blockTrace.directionContribution;
-					}
+			/* add the contribution to the deluxemap */
+			if ( deluxemap ) {
+				tmplm.getSuperDeluxel( x, y ) = blockTrace.directionContribution;
+			}
 
-					/* check for evilness */
-					if ( blockTrace.forceSubsampling > 1 && ( lightSamples > 1 || lightRandomSamples ) ) {
-						lighted++;
-						tmplm.getSuperFlag( x, y ) |= FLAG_FORCE_SUBSAMPLING; /* force */
-					}
-					/* add to count */
-					else if ( blockTrace.color != g_vector3_identity ) {
-						lighted++;
-					}
-				}
+			/* check for evilness */
+			if ( blockTrace.forceSubsampling > 1 && ( lightSamples > 1 || lightRandomSamples ) ) {
+				lighted++;
+				tmplm.getSuperFlag( x, y ) |= FLAG_FORCE_SUBSAMPLING; /* force */
+			}
+			/* add to count */
+			else if ( blockTrace.color != g_vector3_identity ) {
+				lighted++;
 			}
 		}
-		totalLighted += lighted;
-	} );
+	};
+
+	if ( region == nullptr ) {
+		const int rowsPerBlock = splitRows ? std::max( 1, 1024 / std::max( lm->sw, 1 ) ) : std::max( lm->sh, 1 );
+		ParallelFor( ( lm->sh + rowsPerBlock - 1 ) / rowsPerBlock, [&]( int block ){
+			const int y0 = block * rowsPerBlock, y1 = std::min( lm->sh, ( block + 1 ) * rowsPerBlock );
+
+			/* setup */
+			const size_t first = size_t( y0 ) * lm->sw, count = size_t( y1 - y0 ) * lm->sw;
+			memset( tmplm.superLuxels[0] + first, 0, count * sizeof( *lm->superLuxels[0] ) );
+			if ( deluxemap ) {
+				memset( tmplm.superDeluxels + first, 0, count * sizeof( *lm->superDeluxels ) );
+			}
+			if ( lightSamples > 1 || lightRandomSamples ) {
+				memset( tmplm.superFlags + first, 0, count * sizeof( *lm->superFlags ) );
+			}
+
+			trace_t blockTrace = trace;
+			int lighted = 0;
+			for ( int y = y0; y < y1; ++y )
+				for ( int x = 0; x < lm->sw; ++x )
+					luxelPass( x, y, blockTrace, lighted );
+			totalLighted += lighted;
+		} );
+	}
+	else
+	{
+		/* -lightcull: reset what the previous light changed, then only visit the tiles this light may reach */
+		ResetLightLuxels( lm, tmplm, *dirty, splitRows );
+		if ( region->tiles.empty() ) {
+			*dirty = LuxelRect();
+			return 0;
+		}
+		const int numTiles = region->tiles.size();
+		ParallelFor( splitRows ? numTiles : 1, [&]( int task ){
+			trace_t blockTrace = trace;
+			int lighted = 0;
+			for ( int i = splitRows ? task : 0; i < ( splitRows ? task + 1 : numTiles ); ++i )
+			{
+				const int tx = region->tiles[ i ] % tiles->tilesW, ty = region->tiles[ i ] / tiles->tilesW;
+				for ( int y = ty * LightTiles::size; y < std::min( lm->sh, ( ty + 1 ) * LightTiles::size ); ++y )
+					for ( int x = tx * LightTiles::size; x < std::min( lm->sw, ( tx + 1 ) * LightTiles::size ); ++x )
+						luxelPass( x, y, blockTrace, lighted );
+			}
+			totalLighted += lighted;
+		} );
+
+		/* luxels supersampling may change: the region and its neighbors */
+		*dirty = LuxelRect{ std::max( 0, region->rect.x0 - 1 ), std::max( 0, region->rect.y0 - 1 ),
+		                    std::min( lm->sw, region->rect.x1 + 1 ), std::min( lm->sh, region->rect.y1 + 1 ) };
+	}
 
 	/* don't even bother with everything else if nothing was lit */
 	if ( totalLighted == 0 ) {
@@ -2293,33 +2453,40 @@ static int IlluminateRawLightmapLight( rawLightmap_t *lm, rawLightmap_t& tmplm, 
 			}
 		};
 
-		/* walk luxels */
-		const int stampRows = lm->sh - 1, stampColumns = lm->sw - 1;
+		/* walk luxels; -lightcull: stamps not touching the region have no light and change nothing */
+		int stampX0 = 0, stampY0 = 0, stampX1 = lm->sw - 1, stampY1 = lm->sh - 1;
+		if ( region != nullptr ) {
+			stampX0 = std::max( 0, region->rect.x0 - 1 );
+			stampY0 = std::max( 0, region->rect.y0 - 1 );
+			stampX1 = std::min( lm->sw - 1, region->rect.x1 );
+			stampY1 = std::min( lm->sh - 1, region->rect.y1 );
+		}
+		const int stampRows = stampY1 - stampY0, stampColumns = stampX1 - stampX0;
 		if ( splitRows && stampRows > 1 && stampColumns > 0 ) {
 			/* wavefront: stamp x of row y needs stamps up to x + 1 of row y - 1 done;
 			   rows publish their progress every few stamps to keep synchronization cheap */
 			const int stampsPerSync = 32;
 			std::vector<std::atomic<int>> rowDone( stampRows );
-			ParallelFor( stampRows, [&]( int y ){
+			ParallelFor( stampRows, [&]( int row ){
 				trace_t rowTrace = trace;
-				for ( int x0 = 0; x0 < stampColumns; x0 += stampsPerSync )
+				for ( int x0 = stampX0; x0 < stampX1; x0 += stampsPerSync )
 				{
-					const int x1 = std::min( x0 + stampsPerSync, stampColumns );
-					if ( y > 0 ) {
-						const int needed = std::min( x1 + 1, stampColumns );
-						while ( rowDone[ y - 1 ].load( std::memory_order_acquire ) < needed )
+					const int x1 = std::min( x0 + stampsPerSync, stampX1 );
+					if ( row > 0 ) {
+						const int needed = std::min( x1 + 1, stampX1 );
+						while ( rowDone[ row - 1 ].load( std::memory_order_acquire ) < needed )
 							std::this_thread::yield();
 					}
 					for ( int x = x0; x < x1; ++x )
-						stamp( x, y, rowTrace );
-					rowDone[ y ].store( x1, std::memory_order_release );
+						stamp( x, stampY0 + row, rowTrace );
+					rowDone[ row ].store( x1, std::memory_order_release );
 				}
 			} );
 		}
 		else
 		{
-			for ( int y = 0; y < stampRows; ++y )
-				for ( int x = 0; x < stampColumns; ++x )
+			for ( int y = stampY0; y < stampY1; ++y )
+				for ( int x = stampX0; x < stampX1; ++x )
 					stamp( x, y, trace );
 		}
 	}
@@ -2353,7 +2520,7 @@ static int IlluminateRawLightmapLight( rawLightmap_t *lm, rawLightmap_t& tmplm, 
    filtering it if needed. lights must be accumulated in light list order.
  */
 
-static void AccumulateRawLightmapLight( rawLightmap_t *lm, rawLightmap_t& tmplm, const light_t *light, int lightmapNum, bool splitRows ){
+static void AccumulateRawLightmapLight( rawLightmap_t *lm, rawLightmap_t& tmplm, const light_t *light, int lightmapNum, bool splitRows, const LuxelRect *rect = nullptr ){
 	int size;
 
 	/* determine filter radius */
@@ -2378,16 +2545,26 @@ static void AccumulateRawLightmapLight( rawLightmap_t *lm, rawLightmap_t& tmplm,
 		//%	Sys_Printf( "Surface %6d has lightstyle %d\n", rawLightmapNum, light->style );
 	}
 
+	/* -lightcull: in the main style the light only adds something around the luxels it changed (count is 1 already) */
+	LuxelRect area{ 0, 0, lm->sw, lm->sh };
+	if ( rect != nullptr && lightmapNum == 0 ) {
+		area = LuxelRect{ std::max( 0, rect->x0 - luxelFilterRadius ), std::max( 0, rect->y0 - luxelFilterRadius ),
+		                  std::min( lm->sw, rect->x1 + luxelFilterRadius ), std::min( lm->sh, rect->y1 + luxelFilterRadius ) };
+		if ( area.empty() ) {
+			return;
+		}
+	}
+
 	/* copy to permanent luxels; every luxel is independent, so with splitRows blocks of rows run in parallel */
-	const int rowsPerBlock = splitRows ? std::max( 1, 1024 / std::max( lm->sw, 1 ) ) : std::max( lm->sh, 1 );
-	ParallelFor( ( lm->sh + rowsPerBlock - 1 ) / rowsPerBlock, [&]( int block ){
+	const int rowsPerBlock = splitRows ? std::max( 1, 1024 / std::max( lm->sw, 1 ) ) : std::max( area.y1 - area.y0, 1 );
+	ParallelFor( ( area.y1 - area.y0 + rowsPerBlock - 1 ) / rowsPerBlock, [&]( int block ){
 		int x, y, sx, sy;
 		float samples, weight;
 		Vector3 averageColor, averageDir;
 
-		for ( y = block * rowsPerBlock; y < std::min( lm->sh, ( block + 1 ) * rowsPerBlock ); ++y )
+		for ( y = area.y0 + block * rowsPerBlock; y < std::min( area.y1, area.y0 + ( block + 1 ) * rowsPerBlock ); ++y )
 		{
-			for ( x = 0; x < lm->sw; ++x )
+			for ( x = area.x0; x < area.x1; ++x )
 			{
 				/* get cluster and origin */
 				if ( lm->getSuperCluster( x, y ) < CLUSTER_NORMAL ) {
@@ -2682,6 +2859,13 @@ void IlluminateRawLightmap( int rawLightmapNum ){
 
 		Timer splitTimer;
 
+		/* -lightcull: tiles of luxels, to limit each light to the ones it may reach (not with random sample positions) */
+		const bool cull = lightCull && !lightRandomSamples;
+		LightTiles lightTiles;
+		if ( cull ) {
+			SetupLightTiles( lm, lightTiles );
+		}
+
 		/* walk light list */
 		/* -splitwork: with enough lights, compute a large lightmap's lights in parallel batches and
 		   accumulate them in light order. each light in a batch needs its own buffers; their total across
@@ -2710,6 +2894,7 @@ void IlluminateRawLightmap( int rawLightmapNum ){
 				slot.superFlags = safe_malloc( flagsSize );
 			}
 			std::vector<int> lit( numSlots );
+			std::vector<LuxelRect> slotDirty( numSlots, LuxelRect{ 0, 0, lm->sw, lm->sh } );
 
 			for ( int base = 0; base < trace.numLights; base += numSlots )
 			{
@@ -2717,14 +2902,21 @@ void IlluminateRawLightmap( int rawLightmapNum ){
 				ParallelFor( count, [&]( int j ){
 					trace_t lightTrace = trace;
 					lightTrace.light = trace.lights[ base + j ];
-					lit[ j ] = IlluminateRawLightmapLight( lm, slots[ j ], lightTrace, false );
+					if ( cull ) {
+						LightRegion region;
+						LightRegionFor( lightTiles, lm, lightTrace.light, region );
+						lit[ j ] = IlluminateRawLightmapLight( lm, slots[ j ], lightTrace, false, &region, &lightTiles, &slotDirty[ j ] );
+					}
+					else{
+						lit[ j ] = IlluminateRawLightmapLight( lm, slots[ j ], lightTrace, false );
+					}
 				} );
 				for ( int j = 0; j < count; ++j )
 				{
 					const light_t *light = trace.lights[ base + j ];
 					const int lightmapNum = LightmapNumForLightStyle( lm, light );
 					if ( lightmapNum >= 0 && lit[ j ] != 0 ) {
-						AccumulateRawLightmapLight( lm, slots[ j ], light, lightmapNum, false );
+						AccumulateRawLightmapLight( lm, slots[ j ], light, lightmapNum, false, cull ? &slotDirty[ j ] : nullptr );
 					}
 				}
 			}
@@ -2739,6 +2931,8 @@ void IlluminateRawLightmap( int rawLightmapNum ){
 		}
 		else
 		{
+			LuxelRect tmplmDirty{ 0, 0, lm->sw, lm->sh };
+			LightRegion region;
 			for ( int i = 0; i < trace.numLights; ++i )
 			{
 				/* setup trace */
@@ -2760,7 +2954,13 @@ void IlluminateRawLightmap( int rawLightmapNum ){
 				}
 
 				/* compute this light's contribution, then add it */
-				if ( IlluminateRawLightmapLight( lm, tmplm, trace, splitRows ) != 0 ) {
+				if ( cull ) {
+					LightRegionFor( lightTiles, lm, trace.light, region );
+					if ( IlluminateRawLightmapLight( lm, tmplm, trace, splitRows, &region, &lightTiles, &tmplmDirty ) != 0 ) {
+						AccumulateRawLightmapLight( lm, tmplm, trace.light, lightmapNum, splitRows, &tmplmDirty );
+					}
+				}
+				else if ( IlluminateRawLightmapLight( lm, tmplm, trace, splitRows ) != 0 ) {
 					AccumulateRawLightmapLight( lm, tmplm, trace.light, lightmapNum, splitRows );
 				}
 			}

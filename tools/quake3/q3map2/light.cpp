@@ -2676,6 +2676,10 @@ int LightMain( Args& args ){
 			threadsHelpWithJobs = true;
 			Sys_Printf( "Splitting large lightmaps' work across threads\n" );
 		}
+		while ( args.takeArg( "-lightcull" ) ) {
+			lightCull = true;
+			Sys_Printf( "Lighting only the lightmap tiles each light can reach\n" );
+		}
 		while ( args.takeArg( "-embree" ) ) {
 #ifdef Q3MAP2_EMBREE
 			lightEmbree = true;

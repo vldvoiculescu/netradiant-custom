@@ -2100,6 +2100,7 @@ inline bool noGridLighting;
 inline bool noTrace;
 inline bool noSurfaces;
 inline bool lightEmbree;                /* -embree: trace rays with Intel Embree */
+inline bool lightCull;                  /* -lightcull: only light the lightmap tiles a light can reach */
 inline bool patchShadows;
 inline bool cpmaHack;
 
