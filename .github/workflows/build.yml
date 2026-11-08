@@ -27,7 +27,7 @@ jobs:
     steps:
     - uses: msys2/setup-msys2@v2
       with:
-        install: base-devel ${{ matrix.prefix }}-toolchain ${{ matrix.prefix }}-qt5-base ${{ matrix.prefix }}-qt5-svg ${{ matrix.prefix }}-assimp ${{ matrix.prefix }}-libxml2 git unzip p7zip
+        install: base-devel ${{ matrix.prefix }}-toolchain ${{ matrix.prefix }}-qt5-base ${{ matrix.prefix }}-qt5-svg ${{ matrix.prefix }}-assimp ${{ matrix.prefix }}-libxml2 ${{ matrix.prefix }}-embree ${{ matrix.prefix }}-vulkan-headers ${{ matrix.prefix }}-glslang git unzip p7zip
         msystem: ${{ matrix.msystem }}
         path-type: minimal
         release: false
@@ -39,7 +39,8 @@ jobs:
 
     - name: Build
       run: |
-        make MAKEFILE_CONF=msys2-Makefile.conf -j4
+        # q3map2 with -embree (Intel Embree) and -gpu (Vulkan ray query; the SPIR-V is compiled by glslang at build time)
+        make MAKEFILE_CONF=msys2-Makefile.conf -j4 Q3MAP2_EMBREE=yes Q3MAP2_VULKAN=yes
         mkdir -p install/settings
         7z a Windows-${{ matrix.arch }}.zip ./install/*
 #       zip immediately, since .bla files and empty folders get lost somewhere later otherwise
