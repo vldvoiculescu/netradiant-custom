@@ -31,7 +31,8 @@ jobs:
         msystem: ${{ matrix.msystem }}
         path-type: minimal
         release: false
-        update: false
+        update: true
+#       update: the runner image's package database is too old to know embree
 
     - uses: actions/checkout@v4
       with:
