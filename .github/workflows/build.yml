@@ -27,12 +27,15 @@ jobs:
     steps:
     - uses: msys2/setup-msys2@v2
       with:
-        install: base-devel ${{ matrix.prefix }}-toolchain ${{ matrix.prefix }}-qt5-base ${{ matrix.prefix }}-qt5-svg ${{ matrix.prefix }}-assimp ${{ matrix.prefix }}-libxml2 ${{ matrix.prefix }}-embree ${{ matrix.prefix }}-vulkan-headers ${{ matrix.prefix }}-glslang git unzip p7zip
+        install: base-devel ${{ matrix.prefix }}-toolchain ${{ matrix.prefix }}-qt5-base ${{ matrix.prefix }}-qt5-svg ${{ matrix.prefix }}-assimp ${{ matrix.prefix }}-libxml2 ${{ matrix.prefix }}-vulkan-headers ${{ matrix.prefix }}-glslang git unzip p7zip
         msystem: ${{ matrix.msystem }}
         path-type: minimal
         release: false
-        update: true
-#       update: the runner image's package database is too old to know embree
+        update: false
+
+    - name: Install Embree
+      # for q3map2 -embree; MSYS2 dropped embree from the MINGW64 repository, its last MINGW64 build is still on the server
+      run: pacman -U --noconfirm https://repo.msys2.org/mingw/mingw64/mingw-w64-x86_64-embree-4.4.1-2-any.pkg.tar.zst
 
     - uses: actions/checkout@v4
       with:
