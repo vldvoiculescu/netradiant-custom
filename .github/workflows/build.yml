@@ -67,14 +67,15 @@ jobs:
     - name: Install tools
       run: |
           sudo apt-get -qq update
-          sudo apt-get -y install mesa-common-dev qtbase5-dev libqt5svg5-dev libglib2.0-dev libjpeg-dev libpng-dev libassimp-dev
+          sudo apt-get -y install mesa-common-dev qtbase5-dev libqt5svg5-dev libglib2.0-dev libjpeg-dev libpng-dev libassimp-dev libembree-dev libvulkan-dev glslang-tools
     - uses: actions/checkout@v4
       with:
         submodules: recursive
 
     - name: Build
       run: |
-        make CC=gcc-14 CXX=g++-14 CXXFLAGS="-Wno-deprecated-copy" -j4
+        # q3map2 with -embree (Intel Embree) and -gpu (Vulkan ray query; the SPIR-V is compiled by glslang at build time)
+        make CC=gcc-14 CXX=g++-14 CXXFLAGS="-Wno-deprecated-copy" -j4 Q3MAP2_EMBREE=yes Q3MAP2_VULKAN=yes
         ./appimage.sh
         7z a Linux-${{ matrix.arch }}.7z ./NetRadiant-Custom-x86_64.AppImage
 #        7z a Linux-${{ matrix.arch }}.7z ./install/*
