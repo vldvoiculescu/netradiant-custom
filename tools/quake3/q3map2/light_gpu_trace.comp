@@ -1,0 +1,2113 @@
+/* -------------------------------------------------------------------------------
+
+   q3map2 -gpu: traces a batch of rays like TraceLineEmbree() in light_trace.cpp
+
+   the acceleration structure holds the clipped trace node triangles, enlarged by 1.06 about their
+   center, so it reports every triangle ydnar's TraceTriangle() could accept with its epsilons.
+   each candidate gets the exact TraceTriangle() tests and the check that TraceLine_r() would visit
+   the triangle's leaf. the structs here match light_gpu.h.
+
+   ------------------------------------------------------------------------------- */
+
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference : require
+
+layout( local_size_x = 256 ) in;
+
+layout( set = 0, binding = 0 ) uniform accelerationStructureEXT tlas;
+
+struct Ray { vec4 originInhibit; vec4 endDistance; vec4 directionRecv; vec4 colorSky; ivec4 misc; };
+struct Hit { vec4 hitDepth; vec4 color; uvec4 misc; };
+struct Tri { vec4 v0Info; vec4 edge1Path; vec4 edge2PathLength; vec4 st01; vec4 st2Item; };
+struct Info { ivec4 a; ivec4 b; };
+struct Node { vec4 plane; ivec4 misc; };
+
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Rays { Ray r[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) writeonly buffer Hits { Hit h[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Tris { Tri t[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Infos { Info i[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Nodes { Node n[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) readonly buffer Uints { uint u[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) readonly buffer Ints { int i[]; };
+
+/* gathers (dirt, floodlight): the GPU makes the rays of each sample from a set of tangent space vectors */
+struct Sample { vec4 origin; vec4 normal; vec4 right; vec4 up; };
+struct RayValue { double value; uint flags; uint pad; };
+struct GatherOut { float gather; uint flags; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Samples { Sample s[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Vectors { vec4 v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) buffer RayValues { RayValue r[]; };
+layout( buffer_reference, std430, buffer_reference_align = 8 ) writeonly buffer GatherOuts { GatherOut o[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Params
+{
+	Samples samples;
+	Vectors vectors;
+	RayValues values;
+	GatherOuts outs;
+	uint numSamples;
+	uint numVectors;
+	uint mode;                                  /* GATHER_* */
+	float rayLength;
+	float inhibitRadius;
+	int recvShadows;
+	int numSurfaces;
+	uint rayFlags;                              /* GPU_RAY_IN_GRID, GPU_RAY_NO_SURFACES */
+	uint translucentFlag;                       /* C_TRANSLUCENT */
+	float ooDepth;                              /* dirt: 1 / dirtDepth */
+};
+
+/* light_t */
+struct Light { vec4 originType; vec4 normalDist; vec4 colorPhotons; vec4 p1; vec4 p2; ivec4 misc; };
+/* GpuJobLight */
+struct JobLight { ivec4 a; ivec4 b; ivec4 c; ivec4 d; };
+struct Luxel { vec4 originCluster; vec4 normal; };
+struct BspNode { int planeNum; int child0; int child1; int pad; };
+struct BspLeaf { int cluster; int firstBrush; int numBrushes; int pad; };
+
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Lights { Light l[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer JobLights { JobLight j[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Luxels { Luxel x[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) coherent buffer TmpLuxels { vec4 t[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) coherent buffer TmpFlags { uint f[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) buffer OutLuxels { vec4 o[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Vec4s { vec4 v[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer BspNodes { BspNode n[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer BspLeafs { BspLeaf l[]; };
+layout( buffer_reference, std430, buffer_reference_align = 8 ) readonly buffer IntPairs { ivec2 p[]; };
+layout( buffer_reference, std430, buffer_reference_align = 4 ) buffer Counters { uint c[]; };
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer TileItems { ivec4 t[]; };
+layout( buffer_reference, std430, buffer_reference_align = 8 ) buffer CandidateList { uvec2 c[]; };
+
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer World
+{
+	BspNodes nodes;
+	Vec4s planes;
+	BspLeafs leafs;
+	Ints leafBrushes;
+	IntPairs brushes;                           /* firstSide, numSides */
+	Ints sides;                                 /* plane numbers */
+	Uints opaque;                               /* per brush: 1 = opaque */
+	Uints vis;                                  /* bspVisBytes, 4 per uint */
+	int hasVis;
+	int leafBytes;
+	int numOpaque;
+	int pad;
+};
+
+layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer Job
+{
+	Luxels luxels;
+	TmpLuxels tmp;
+	TmpLuxels sub;                              /* supersampling: luxels subsampled ahead (FLAG_CANDIDATE) */
+	TmpFlags flags;
+	OutLuxels outs;
+	JobLights jobLights;
+	Ints lightClusters;
+	Lights lights;
+	Vec4s windings;
+	Counters counters;                          /* rays with too many surfaces, too deep in the bsp, unpredicted subsamples, candidates,
+	                                               the round's candidates [ 4 ] to [ 5 ], paused lights (all rounds),
+	                                               paused lights (this round), then per job light
+	                                               its next stamp diagonal (RESUME_DONE: walked) */
+	TileItems items;                            /* job light, tile x, y: the initial pass and the stamps, a workgroup each */
+	CandidateList candidates;                   /* tmp index, job light of the luxels to subsample ahead */
+	Counters dispatchArgs;                      /* the subsampling dispatch */
+	int sw, sh, numJobLights, numLightClusters;
+	int recvShadows, numSurfaces, twoSided, testOcclusion;
+	int lightSamples, searchBoxSize, faster, lightAngleHL;
+	int oneSky, totalTmp, rayFlags, numItems;
+	float linearScale;
+	int inlineBudget;                           /* luxels a light's walk may subsample itself per round */
+	TmpFlags diagonals;                         /* per job light from its d.z: a bit per stamp diagonal with stamps to visit */
+};
+
+layout( push_constant ) uniform Constants
+{
+	Rays rays;
+	Hits hits;
+	Ints surfaces;
+	Tris tris;
+	Infos infos;
+	Nodes nodes;
+	Uints paths;
+	Uints images;
+	uint count;
+	int headNode;
+	int numBspNodes;
+	uint skyFlag;
+	uint debugMode;                             /* Q3MAP2_DEBUG_GPU_MODE: DEBUG_* bits */
+	uint kernel;                                /* KERNEL_* */
+	Params params;                              /* KERNEL_GATHER_* */
+	Job job;                                    /* KERNEL_LIGHT_* */
+	World world;                                /* the bsp tree, brushes and pvs */
+} pc;
+
+const uint KERNEL_TRACE = 0;                    /* trace pc.rays into pc.hits */
+const uint KERNEL_GATHER_RAYS = 1;              /* trace the rays of the samples, a value per ray */
+const uint KERNEL_GATHER_REDUCE = 2;            /* sum the values of each sample, in the CPU's order */
+const uint KERNEL_LIGHT_INITIAL = 3;            /* one sample per luxel and light */
+const uint KERNEL_LIGHT_SUPERSAMPLE = 4;        /* (unused) */
+const uint KERNEL_LIGHT_MARK = 6;               /* supersampling: stamps that may subsample, with the initial pass values */
+const uint KERNEL_LIGHT_SUBSAMPLE = 7;          /* supersampling: their luxels subsampled ahead, in parallel */
+const uint KERNEL_LIGHT_WALK = 8;               /* supersampling: the stamps in the CPU's order, a thread per light */
+const uint KERNEL_LIGHT_ARGS = 10;              /* the subsampling dispatch size */
+const uint KERNEL_LIGHT_ACCUMULATE = 5;         /* add the lights to the lightmap, in light order */
+
+const uint GATHER_DIRT = 0;                     /* DirtForSample(), dirtMode 0 */
+const uint GATHER_FLOODLIGHT = 1;               /* FloodLightForSample() */
+
+const uint GATHER_OVERFLOW = 1;                 /* a ray needs the CPU: so does the sample */
+
+/* light_gpu.h */
+const uint GPU_RAY_TEST_ALL = 1;
+const uint GPU_RAY_TREE_ORDER = 2;
+const uint GPU_RAY_IN_GRID = 4;
+const uint GPU_RAY_NO_SURFACES = 8;
+const uint GPU_RAY_SKIP = 16;
+
+const uint GPU_HIT_OPAQUE = 1;
+const uint GPU_HIT_PASS_SOLID = 2;
+const uint GPU_HIT_POINT = 4;
+const uint GPU_HIT_DEPTH = 8;
+const uint GPU_HIT_FORCE_SUBSAMPLING = 16;
+const uint GPU_HIT_OVERFLOW = 32;
+const uint GPU_HIT_SOLID_OVERFLOW = 64;          /* with GPU_HIT_OVERFLOW: the solid space stack was full */
+
+const int GPU_INFO_OPAQUE = 0;
+const int GPU_INFO_SKY = 1;
+const int GPU_INFO_FILTER = 2;
+const int GPU_INFO_FILTER_COLOR = 4;
+const int GPU_INFO_FILTER_SHADOW = 8;
+
+/* light_trace.cpp */
+const float TRACE_ON_EPSILON = 0.1;
+const int TRACE_LEAF_SOLID = -2;
+const float BARY_EPSILON = 0.01;
+const float ASLF_EPSILON = 0.0001;
+const float COPLANAR_EPSILON = 0.25;
+const float SELF_SHADOW_EPSILON = 0.5;
+
+/* TriangleTest */
+const int TEST_IGNORED = 0;
+const int TEST_FLAGS = 1;
+const int TEST_SKY = 2;
+const int TEST_FILTER = 3;
+const int TEST_OPAQUE = 4;
+
+/* debugging aid: parts of the work to skip, to measure their cost */
+const uint DEBUG_NO_TRACE = 1;
+const uint DEBUG_NO_SOLID = 2;
+const uint DEBUG_NO_LEAF = 4;
+const uint DEBUG_NO_CLASSIFY = 8;
+const uint DEBUG_NO_SUPERSAMPLE = 16;
+const uint DEBUG_NO_SUBSAMPLE = 32;
+const uint DEBUG_NO_BSP_CLUSTER = 64;
+const uint DEBUG_FLOAT_MATH = 128;
+
+/* triangles that don't stop the ray but count for its result; more and the CPU traces the ray */
+const int MAX_PASSED = 16;
+/* TraceSolid() stack; deeper and the CPU traces the ray */
+const int SOLID_STACK = 64;
+
+/* the ray */
+vec3 rOrigin, rEnd, rDirection;
+float rInhibit, rDistance;
+int rRecvShadows, rLightSky, rSurfacesOffset, rNumSurfaces;
+uint rFlags;
+
+/* the CPU's float math, without fused multiply-adds */
+precise float Dot( vec3 a, vec3 b ){
+	precise float d = a.x * b.x + a.y * b.y + a.z * b.z;
+	return d;
+}
+
+precise vec3 Cross( vec3 a, vec3 b ){
+	precise vec3 c = vec3( a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x );
+	return c;
+}
+
+precise float PlaneDistance( Node node, vec3 p ){
+	const int type = node.misc.x;
+	precise float d = type < 3 ? p[ type ] - node.plane.w : Dot( p, node.plane.xyz ) - node.plane.w;
+	return d;
+}
+
+precise vec3 Split( vec3 origin, vec3 end, float front, float back ){
+	precise vec3 mid = origin + ( end - origin ) * ( front / ( front - back ) );
+	return mid;
+}
+
+/* TraceSolid_r(): 1 = solid space at hit, 0 = none, -1 = stack overflow */
+int TraceSolid( vec3 origin, vec3 end, out vec3 hit ){
+	int stackNode[ SOLID_STACK ];
+	vec3 stackOrigin[ SOLID_STACK ];
+	vec3 stackEnd[ SOLID_STACK ];
+	int sp = 0;
+	const bool testAll = ( rFlags & GPU_RAY_TEST_ALL ) != 0;
+	int nodeNum = pc.headNode;
+	hit = origin;
+
+	for ( ;; )
+	{
+		bool done = true;
+		if ( nodeNum < 0 ) {
+			hit = origin;
+			return 1;
+		}
+		if ( nodeNum < pc.numBspNodes ) {
+			const Node node = pc.nodes.n[ nodeNum ];
+			const int type = node.misc.x;
+			if ( type == TRACE_LEAF_SOLID ) {
+				hit = origin;
+				return 1;
+			}
+			if ( type >= 0 && !( testAll && node.misc.w == 0 ) ) {
+				precise float front = PlaneDistance( node, origin );
+				precise float back = PlaneDistance( node, end );
+				if ( front >= -TRACE_ON_EPSILON && back >= -TRACE_ON_EPSILON ) {
+					nodeNum = node.misc.y;
+					continue;
+				}
+				if ( front < TRACE_ON_EPSILON && back < TRACE_ON_EPSILON ) {
+					nodeNum = node.misc.z;
+					continue;
+				}
+				const bool backFirst = front < 0;
+				precise vec3 mid = Split( origin, end, front, back );
+				if ( sp == SOLID_STACK ) {
+					return -1;
+				}
+				stackNode[ sp ] = backFirst ? node.misc.y : node.misc.z;
+				stackOrigin[ sp ] = mid;
+				stackEnd[ sp ] = end;
+				++sp;
+				nodeNum = backFirst ? node.misc.z : node.misc.y;
+				end = mid;
+				continue;
+			}
+		}
+		/* nothing below this node: the next segment */
+		if ( sp == 0 ) {
+			return 0;
+		}
+		--sp;
+		nodeNum = stackNode[ sp ];
+		origin = stackOrigin[ sp ];
+		end = stackEnd[ sp ];
+	}
+}
+
+/* RayPassesLeaf(): whether TraceLine_r() visits the leaf, and where the ray enters it */
+bool RayPassesLeaf( int offset, int length, out float leafEntry ){
+	vec3 origin = rOrigin;
+	vec3 end = rEnd;
+	leafEntry = 0;
+	for ( int i = 0; i < length; ++i )
+	{
+		const uint p = pc.paths.u[ offset + i ];
+		const Node node = pc.nodes.n[ int( p & 0x7fffffffu ) ];
+		const int side = int( p >> 31 );
+		precise float front = PlaneDistance( node, origin );
+		precise float back = PlaneDistance( node, end );
+		if ( front >= -TRACE_ON_EPSILON && back >= -TRACE_ON_EPSILON ) {
+			if ( side != 0 ) {
+				return false;
+			}
+		}
+		else if ( front < TRACE_ON_EPSILON && back < TRACE_ON_EPSILON ) {
+			if ( side != 1 ) {
+				return false;
+			}
+		}
+		else
+		{
+			const int first = front < 0 ? 1 : 0;
+			precise vec3 mid = Split( origin, end, front, back );
+			if ( side == first ) {
+				end = mid;
+			}
+			else{
+				origin = mid;
+			}
+		}
+	}
+	precise vec3 d = origin - rOrigin;
+	precise float lengthSquared = Dot( d, d );
+	leafEntry = sqrt( lengthSquared );
+	return true;
+}
+
+struct Result
+{
+	int test;
+	int tri;
+	float depth;
+	float leafEntry;
+	int item;
+	int kind;
+	vec3 filterColor;
+	float filterShadow;
+};
+
+/* TestTraceTriangle() + RayPassesLeaf() = ClassifyTriangle() */
+Result Classify( int tri ){
+	Result r;
+	r.test = TEST_IGNORED;
+	r.tri = tri;
+	r.depth = 0;
+	r.leafEntry = 0;
+	r.item = 0;
+	r.kind = 0;
+	r.filterColor = vec3( 1 );
+	r.filterShadow = 1;
+
+	const Tri tt = pc.tris.t[ tri ];
+	const Info ti = pc.infos.i[ floatBitsToInt( tt.v0Info.w ) ];
+	const int castShadows = ti.a.x;
+
+	/* worldspawn group only receives shadows from positive groups */
+	if ( rRecvShadows == 1 ) {
+		if ( castShadows <= 0 ) {
+			return r;
+		}
+	}
+	/* receive shadows from same group and worldspawn group */
+	else if ( rRecvShadows > 1 ) {
+		if ( castShadows != 1 && abs( castShadows ) != abs( rRecvShadows ) ) {
+			return r;
+		}
+	}
+	/* receive shadows from the same group only (< 0) */
+	else
+	{
+		if ( abs( castShadows ) != abs( rRecvShadows ) ) {
+			return r;
+		}
+	}
+
+	/* skip patches when doing the grid */
+	if ( ( rFlags & GPU_RAY_IN_GRID ) != 0 && ti.a.z != 0 ) {
+		return r;
+	}
+
+	const vec3 edge1 = tt.edge1Path.xyz;
+	const vec3 edge2 = tt.edge2PathLength.xyz;
+	precise vec3 pvec = Cross( rDirection, edge2 );
+	precise float det = Dot( edge1, pvec );
+	if ( abs( det ) < COPLANAR_EPSILON ) {
+		return r;
+	}
+	precise float invDet = 1.0 / det;
+	precise vec3 tvec = rOrigin - tt.v0Info.xyz;
+	precise float u = Dot( tvec, pvec ) * invDet;
+	if ( u < -BARY_EPSILON || u > ( 1.0 + BARY_EPSILON ) ) {
+		return r;
+	}
+	precise vec3 qvec = Cross( tvec, edge1 );
+	precise float v = Dot( rDirection, qvec ) * invDet;
+	if ( v < -BARY_EPSILON || ( u + v ) > ( 1.0 + BARY_EPSILON ) ) {
+		return r;
+	}
+	precise float depth = Dot( edge2, qvec ) * invDet;
+	r.depth = depth;
+	if ( depth <= rInhibit || depth >= rDistance ) {
+		return r;
+	}
+
+	/* self-shadowing */
+	if ( depth <= SELF_SHADOW_EPSILON ) {
+		for ( int i = 0; i < rNumSurfaces; ++i )
+		{
+			if ( pc.surfaces.i[ rSurfacesOffset + i ] == ti.a.y ) {
+				return r;
+			}
+		}
+	}
+
+	r.kind = ti.b.y;
+	const int kind = r.kind & 3;
+	if ( kind == GPU_INFO_SKY ) {
+		r.test = TEST_SKY;
+	}
+	else if ( kind == GPU_INFO_OPAQUE ) {
+		r.test = TEST_OPAQUE;
+	}
+	else{
+		r.test = TEST_FLAGS;
+		/* try to avoid double shadows near triangle seams */
+		if ( !( u < -ASLF_EPSILON || u > ( 1.0 + ASLF_EPSILON ) ||
+		        v < -ASLF_EPSILON || ( u + v ) > ( 1.0 + ASLF_EPSILON ) ) ) {
+			precise float w = 1.0 - ( u + v );
+			precise float s = w * tt.st01.x + u * tt.st01.z + v * tt.st2Item.x;
+			precise float t = w * tt.st01.y + u * tt.st01.w + v * tt.st2Item.y;
+			s = s - floor( s );
+			t = t - floor( t );
+			const int width = ti.b.w >> 16;
+			const int height = ti.b.w & 0xffff;
+			const int is = clamp( int( s * float( width ) ), 0, width - 1 );
+			const int it = clamp( int( t * float( height ) ), 0, height - 1 );
+			const uint pixel = pc.images.u[ ti.b.z + it * width + is ];
+			r.test = TEST_FILTER;
+			r.filterColor = vec3( float( pixel & 0xffu ), float( ( pixel >> 8 ) & 0xffu ), float( ( pixel >> 16 ) & 0xffu ) ) * ( 1.0 / 255.0 );
+			r.filterShadow = ( 1.0 / 255.0 ) * float( 255u - ( pixel >> 24 ) );
+		}
+	}
+
+	/* TraceLine() only tests the triangle when the ray passes its leaf */
+	if ( ( pc.debugMode & DEBUG_NO_LEAF ) == 0 && !RayPassesLeaf( floatBitsToInt( tt.edge1Path.w ), floatBitsToInt( tt.edge2PathLength.w ), r.leafEntry ) ) {
+		r.test = TEST_IGNORED;
+	}
+	r.item = floatBitsToInt( tt.st2Item.z );
+	return r;
+}
+
+bool TreeOrderLess( float entryA, int itemA, float entryB, int itemB ){
+	return entryA < entryB || ( entryA == entryB && itemA < itemB );
+}
+
+/* a ray with more passed triangles than Trace() keeps, nearest opaque triangle known: a second walk applies
+   the ones TraceLine() tests before the opaque one as they come. color filters multiply, flags add up and
+   only the first sky triangle counts, so the order doesn't matter, but for which filter makes the color
+   opaque: the hit depth is the opaque triangle's (unused by the callers: rays with a light) */
+void TraceStream( Result opaque, float segment, inout vec3 color, inout uint compileFlags, inout uint status, inout uint skyBits, inout float hitDepth ){
+	const bool hasOpaque = opaque.test == TEST_OPAQUE;
+	Result sky;
+	sky.test = TEST_IGNORED;
+	precise vec3 filtered = color;
+	uint flags = 0;
+	bool force = false;
+
+	rayQueryEXT query;
+	rayQueryInitializeEXT( query, tlas, gl_RayFlagsNoOpaqueEXT, 0xff, rOrigin, 0.0, rDirection, segment );
+	while ( rayQueryProceedEXT( query ) )
+	{
+		const Result r = Classify( rayQueryGetIntersectionPrimitiveIndexEXT( query, false ) );
+		if ( r.test == TEST_IGNORED || r.test == TEST_OPAQUE ) {
+			continue;
+		}
+		if ( hasOpaque && !TreeOrderLess( r.leafEntry, r.item, opaque.leafEntry, opaque.item ) ) {
+			continue;
+		}
+		if ( r.test == TEST_SKY ) {
+			if ( sky.test != TEST_SKY || TreeOrderLess( r.leafEntry, r.item, sky.leafEntry, sky.item ) ) {
+				sky = r;
+			}
+			continue;
+		}
+		flags |= uint( pc.infos.i[ floatBitsToInt( pc.tris.t[ r.tri ].v0Info.w ) ].a.w );
+		force = true;
+		if ( r.test == TEST_FILTER ) {
+			if ( ( r.kind & GPU_INFO_FILTER_COLOR ) != 0 ) {
+				filtered *= r.filterColor;
+			}
+			if ( ( r.kind & GPU_INFO_FILTER_SHADOW ) != 0 ) {
+				filtered *= r.filterShadow;
+			}
+		}
+	}
+
+	if ( sky.test == TEST_SKY ) {
+		const Info ti = pc.infos.i[ floatBitsToInt( pc.tris.t[ sky.tri ].v0Info.w ) ];
+		flags |= uint( ti.a.w );
+		if ( rLightSky != -1 && ti.b.x != -1 ) {
+			skyBits |= 1u << uint( ti.b.x );
+		}
+	}
+	compileFlags |= flags;
+	if ( force ) {
+		status |= GPU_HIT_FORCE_SUBSAMPLING;
+	}
+	if ( filtered.x <= 0.001 && filtered.y <= 0.001 && filtered.z <= 0.001 ) {
+		color = vec3( 0 );
+		status |= GPU_HIT_OPAQUE;
+	}
+	else if ( hasOpaque ) {
+		compileFlags |= uint( pc.infos.i[ floatBitsToInt( pc.tris.t[ opaque.tri ].v0Info.w ) ].a.w );
+		hitDepth = opaque.depth;
+		color = vec3( 0 );
+		status |= GPU_HIT_DEPTH | GPU_HIT_OPAQUE;
+	}
+	else{
+		color = filtered;
+	}
+}
+
+/* TraceLineEmbree() for the ray in the r* globals */
+void Trace( vec3 inColor, out vec3 hitPoint, out float hitDepth, out vec3 outColor, out uint compileFlags, out uint status, out uint skyBits ){
+	hitPoint = rOrigin;
+	hitDepth = 0;
+	precise vec3 color = inColor;
+	compileFlags = 0;
+	status = 0;
+	skyBits = 0;
+
+	for ( ;; ) /* one pass, break = done */
+	{
+		if ( ( rFlags & GPU_RAY_SKIP ) != 0 || ( pc.debugMode & DEBUG_NO_TRACE ) != 0 ) {
+			break;
+		}
+
+		/* solid space */
+		float segment = rDistance;
+		vec3 solidHit;
+		const int solid = ( pc.debugMode & DEBUG_NO_SOLID ) != 0 ? 0 : TraceSolid( rOrigin, rEnd, solidHit );
+		if ( solid < 0 ) {
+			status = GPU_HIT_OVERFLOW | GPU_HIT_SOLID_OVERFLOW;
+			break;
+		}
+		if ( solid > 0 ) {
+			status |= GPU_HIT_PASS_SOLID | GPU_HIT_POINT;
+			hitPoint = solidHit;
+			if ( ( rFlags & GPU_RAY_TEST_ALL ) == 0 ) {
+				status |= GPU_HIT_OPAQUE;
+				break;
+			}
+			/* surfaces up to the edge of solid space (e.g. sky) count */
+			precise vec3 d = solidHit - rOrigin;
+			precise float lengthSquared = Dot( d, d );
+			segment = min( segment, sqrt( lengthSquared ) + 1.0 );
+		}
+
+		if ( ( rFlags & GPU_RAY_NO_SURFACES ) != 0 ) {
+			break;
+		}
+
+		const bool treeOrder = ( rFlags & GPU_RAY_TREE_ORDER ) != 0;
+		Result opaque;
+		opaque.test = TEST_IGNORED;
+		Result sky;
+		sky.test = TEST_IGNORED;
+
+		int passedTri[ MAX_PASSED ];
+		int passedTest[ MAX_PASSED ];
+		float passedDepth[ MAX_PASSED ];
+		float passedEntry[ MAX_PASSED ];
+		int passedItem[ MAX_PASSED ];
+		int passedKind[ MAX_PASSED ];
+		vec3 passedColor[ MAX_PASSED ];
+		float passedShadow[ MAX_PASSED ];
+		int numPassed = 0;
+		bool overflow = false;
+
+		rayQueryEXT query;
+		rayQueryInitializeEXT( query, tlas, gl_RayFlagsNoOpaqueEXT, 0xff, rOrigin, 0.0, rDirection, segment );
+		while ( rayQueryProceedEXT( query ) )
+		{
+			const int tri = rayQueryGetIntersectionPrimitiveIndexEXT( query, false );
+			if ( ( pc.debugMode & DEBUG_NO_CLASSIFY ) != 0 ) {
+				rayQueryConfirmIntersectionEXT( query );
+				continue;
+			}
+			const Result r = Classify( tri );
+			if ( r.test == TEST_IGNORED ) {
+				continue;
+			}
+			if ( r.test == TEST_OPAQUE ) {
+				if ( treeOrder ) {
+					if ( opaque.test != TEST_OPAQUE || TreeOrderLess( r.leafEntry, r.item, opaque.leafEntry, opaque.item ) ) {
+						opaque = r;
+					}
+				}
+				else if ( opaque.test != TEST_OPAQUE || r.depth < opaque.depth ) {
+					/* the nearest: shortens the ray */
+					opaque = r;
+					rayQueryConfirmIntersectionEXT( query );
+				}
+				continue;
+			}
+			if ( r.test == TEST_SKY ) {
+				/* only the first sky triangle in tree order counts: the ones after it are skipped
+				   ("don't double-trace against sky"), so keep just that one */
+				if ( sky.test != TEST_SKY || TreeOrderLess( r.leafEntry, r.item, sky.leafEntry, sky.item ) ) {
+					sky = r;
+				}
+				continue;
+			}
+			bool seen = false;
+			for ( int i = 0; i < numPassed; ++i )
+			{
+				if ( passedTri[ i ] == tri ) {
+					seen = true;
+				}
+			}
+			if ( seen ) {
+				continue;
+			}
+			if ( numPassed == MAX_PASSED ) {
+				overflow = true;
+				if ( treeOrder ) {
+					rayQueryTerminateEXT( query );
+					break;
+				}
+				/* keep finding the nearest opaque triangle for TraceStream() */
+				continue;
+			}
+			passedTri[ numPassed ] = tri;
+			passedTest[ numPassed ] = r.test;
+			passedDepth[ numPassed ] = r.depth;
+			passedEntry[ numPassed ] = r.leafEntry;
+			passedItem[ numPassed ] = r.item;
+			passedKind[ numPassed ] = r.kind;
+			passedColor[ numPassed ] = r.filterColor;
+			passedShadow[ numPassed ] = r.filterShadow;
+			++numPassed;
+		}
+		if ( sky.test == TEST_SKY && !overflow ) {
+			if ( numPassed == MAX_PASSED ) {
+				overflow = true;
+			}
+			else
+			{
+				passedTri[ numPassed ] = sky.tri;
+				passedTest[ numPassed ] = sky.test;
+				passedDepth[ numPassed ] = sky.depth;
+				passedEntry[ numPassed ] = sky.leafEntry;
+				passedItem[ numPassed ] = sky.item;
+				passedKind[ numPassed ] = sky.kind;
+				passedColor[ numPassed ] = sky.filterColor;
+				passedShadow[ numPassed ] = sky.filterShadow;
+				++numPassed;
+			}
+		}
+		if ( overflow ) {
+			if ( treeOrder ) {
+				status = GPU_HIT_OVERFLOW;
+			}
+			else{
+				TraceStream( opaque, segment, color, compileFlags, status, skyBits, hitDepth );
+			}
+			break;
+		}
+
+		/* apply the passed triangles that TraceLine() tests before the opaque one, in its order */
+		int order[ MAX_PASSED ];
+		for ( int i = 0; i < numPassed; ++i )
+		{
+			int j = i;
+			for ( ; j > 0 && TreeOrderLess( passedEntry[ i ], passedItem[ i ], passedEntry[ order[ j - 1 ] ], passedItem[ order[ j - 1 ] ] ); --j )
+				order[ j ] = order[ j - 1 ];
+			order[ j ] = i;
+		}
+
+		bool filterOpaque = false;
+		for ( int k = 0; k < numPassed; ++k )
+		{
+			const int i = order[ k ];
+			if ( opaque.test == TEST_OPAQUE && !TreeOrderLess( passedEntry[ i ], passedItem[ i ], opaque.leafEntry, opaque.item ) ) {
+				break;
+			}
+			const Info ti = pc.infos.i[ floatBitsToInt( pc.tris.t[ passedTri[ i ] ].v0Info.w ) ];
+			const uint siFlags = uint( ti.a.w );
+
+			/* don't double-trace against sky */
+			if ( ( compileFlags & siFlags & pc.skyFlag ) != 0 ) {
+				continue;
+			}
+
+			/* stack compile flags */
+			compileFlags |= siFlags;
+
+			if ( passedTest[ i ] == TEST_SKY ) {
+				if ( rLightSky != -1 && ti.b.x != -1 ) {
+					skyBits |= 1u << uint( ti.b.x );
+				}
+				continue;
+			}
+
+			/* alphashadow / lightfilter shader */
+			status |= GPU_HIT_FORCE_SUBSAMPLING;
+			if ( passedTest[ i ] != TEST_FILTER ) {
+				continue;
+			}
+			if ( ( passedKind[ i ] & GPU_INFO_FILTER_COLOR ) != 0 ) {
+				color *= passedColor[ i ];
+			}
+			if ( ( passedKind[ i ] & GPU_INFO_FILTER_SHADOW ) != 0 ) {
+				color *= passedShadow[ i ];
+			}
+
+			/* check filter for opaque */
+			if ( color.x <= 0.001 && color.y <= 0.001 && color.z <= 0.001 ) {
+				color = vec3( 0 );
+				hitDepth = passedDepth[ i ];
+				status |= GPU_HIT_DEPTH | GPU_HIT_OPAQUE;
+				filterOpaque = true;
+				break;
+			}
+		}
+
+		/* opaque triangle */
+		if ( !filterOpaque && opaque.test == TEST_OPAQUE ) {
+			compileFlags |= uint( pc.infos.i[ floatBitsToInt( pc.tris.t[ opaque.tri ].v0Info.w ) ].a.w );
+			hitDepth = opaque.depth;
+			color = vec3( 0 );
+			status |= GPU_HIT_DEPTH | GPU_HIT_OPAQUE;
+		}
+		break;
+	}
+	outColor = color;
+}
+
+void TraceRays(){
+	const uint index = gl_GlobalInvocationID.x;
+	if ( index >= pc.count ) {
+		return;
+	}
+
+	const Ray ray = pc.rays.r[ index ];
+	rOrigin = ray.originInhibit.xyz;
+	rInhibit = ray.originInhibit.w;
+	rEnd = ray.endDistance.xyz;
+	rDistance = ray.endDistance.w;
+	rDirection = ray.directionRecv.xyz;
+	rRecvShadows = floatBitsToInt( ray.directionRecv.w );
+	rLightSky = floatBitsToInt( ray.colorSky.w );
+	rSurfacesOffset = ray.misc.x;
+	rNumSurfaces = ray.misc.y;
+	rFlags = uint( ray.misc.z );
+
+	Hit hit;
+	vec3 hitPoint, color;
+	float hitDepth;
+	uint compileFlags, status, skyBits;
+	Trace( ray.colorSky.xyz, hitPoint, hitDepth, color, compileFlags, status, skyBits );
+	hit.hitDepth = vec4( hitPoint, hitDepth );
+	hit.color = vec4( color, 0 );
+	hit.misc = uvec4( compileFlags, status, skyBits, 0 );
+	pc.hits.h[ index ] = hit;
+}
+
+/* the neighbouring doubles (bit patterns +-1) */
+double NextBits( double x, int step ){
+	uvec2 bits = unpackDouble2x32( x );
+	if ( step > 0 ) {
+		bits.x += 1u;
+		if ( bits.x == 0u ) {
+			bits.y += 1u;
+		}
+	}
+	else
+	{
+		if ( bits.x == 0u ) {
+			bits.y -= 1u;
+		}
+		bits.x -= 1u;
+	}
+	return packDouble2x32( bits );
+}
+
+/* double sqrt and division rounded to nearest like the CPU's: the GPU's may be off by an ulp,
+   so the neighbours with a smaller remainder are taken */
+double SqrtRN( double x ){
+	precise double r = sqrt( x );
+	if ( !( x > 0 ) || isinf( x ) ) {
+		return r;
+	}
+	for ( int step = -1; step <= 1; step += 2 )
+	{
+		for ( ;; )
+		{
+			const double c = NextBits( r, step );
+			precise double remainderC = fma( -c, c, x );
+			precise double remainderR = fma( -r, r, x );
+			if ( abs( remainderC ) < abs( remainderR ) ) {
+				r = c;
+			}
+			else{
+				break;
+			}
+		}
+	}
+	return r;
+}
+
+double DivRN( double a, double b ){
+	precise double q = a / b;
+	if ( q == 0 || isinf( q ) || isnan( q ) ) {
+		return q;
+	}
+	for ( int step = -1; step <= 1; step += 2 )
+	{
+		for ( ;; )
+		{
+			const double c = NextBits( q, step );
+			precise double remainderC = fma( -c, b, a );
+			precise double remainderQ = fma( -q, b, a );
+			if ( abs( remainderC ) < abs( remainderQ ) ) {
+				q = c;
+			}
+			else{
+				break;
+			}
+		}
+	}
+	return q;
+}
+
+/* one ray of a sample, made like DirtForSample() / FloodLightForSample() do: the value it adds to the sample */
+void GatherRays(){
+	const uint index = gl_GlobalInvocationID.x;
+	const uint numVectors = pc.params.numVectors;
+	if ( index >= pc.params.numSamples * numVectors ) {
+		return;
+	}
+	const Sample luxel = pc.params.samples.s[ index / numVectors ];
+	const vec3 vector = pc.params.vectors.v[ index % numVectors ].xyz;
+	const float rayLength = pc.params.rayLength;
+
+	/* tangent space vector; trace->end = trace->origin + direction * depth */
+	precise vec3 direction = luxel.right.xyz * vector.x + luxel.up.xyz * vector.y + luxel.normal.xyz * vector.z;
+	precise vec3 end = luxel.origin.xyz + direction * rayLength;
+
+	/* SetupTrace(): VectorNormalize() works in double */
+	precise vec3 displacement = end - luxel.origin.xyz;
+	const dvec3 d = dvec3( displacement );
+	precise double lengthSquared = d.x * d.x + d.y * d.y + d.z * d.z;
+	const double length = SqrtRN( lengthSquared );
+
+	rOrigin = luxel.origin.xyz;
+	rEnd = end;
+	rDirection = length == 0 ? vec3( 0 ) : vec3( DivRN( d.x, length ), DivRN( d.y, length ), DivRN( d.z, length ) );
+	rDistance = float( length );
+	rInhibit = pc.params.inhibitRadius;
+	rRecvShadows = pc.params.recvShadows;
+	rLightSky = -1;
+	rSurfacesOffset = 0;
+	rNumSurfaces = pc.params.numSurfaces;
+	rFlags = GPU_RAY_TREE_ORDER | pc.params.rayFlags;
+	/* TraceLine()'s early outs */
+	if ( rRecvShadows == 0 || rDistance <= 0.00001 ) {
+		rFlags |= GPU_RAY_SKIP;
+	}
+
+	vec3 hitPoint, color;
+	float hitDepth;
+	uint compileFlags, status, skyBits;
+	Trace( vec3( 1 ), hitPoint, hitDepth, color, compileFlags, status, skyBits );
+
+	RayValue value;
+	value.value = 0;
+	value.flags = ( status & GPU_HIT_OVERFLOW ) != 0 ? GATHER_OVERFLOW : 0;
+	value.pad = 0;
+
+	/* trace->hit, and its distance: vector3_length() of a float vector, in double */
+	precise vec3 hit = ( status & GPU_HIT_POINT ) != 0 ? hitPoint : rOrigin;
+	if ( ( status & GPU_HIT_DEPTH ) != 0 ) {
+		hit = rOrigin + rDirection * hitDepth;
+	}
+	precise vec3 toHit = hit - rOrigin;
+	precise float hitSquared = Dot( toHit, toHit );
+	const double hitLength = SqrtRN( double( hitSquared ) );
+	const bool opaque = ( status & GPU_HIT_OPAQUE ) != 0;
+
+	if ( pc.params.mode == GATHER_DIRT ) {
+		/* gatherDirt += 1.0f - ooDepth * vector3_length( trace->hit - trace->origin ) */
+		if ( opaque ) {
+			precise double contribution = 1.0LF - double( pc.params.ooDepth ) * hitLength;
+			value.value = contribution;
+		}
+	}
+	else
+	{
+		float contribution = 1;
+		if ( ( compileFlags & ( pc.skyFlag | pc.params.translucentFlag ) ) != 0 ) {
+			contribution = 1;
+		}
+		else if ( opaque ) {
+			const float distance = float( hitLength );
+			/* float division, correctly rounded like the CPU's: in double */
+			const float ratio = float( DivRN( double( distance ), double( rayLength ) ) );
+			contribution = min( 1.0, ratio );
+		}
+		value.value = double( contribution );
+	}
+	pc.params.values.r[ index ] = value;
+}
+
+/* the sum of a sample's ray values, in the order the CPU adds them */
+void GatherReduce(){
+	const uint index = gl_GlobalInvocationID.x;
+	if ( index >= pc.params.numSamples ) {
+		return;
+	}
+	const uint numVectors = pc.params.numVectors;
+	precise float gather = 0;
+	uint flags = 0;
+	for ( uint i = 0; i < numVectors; ++i )
+	{
+		const RayValue value = pc.params.values.r[ index * numVectors + i ];
+		flags |= value.flags;
+		if ( pc.params.mode == GATHER_DIRT ) {
+			/* float += double */
+			precise double sum = double( gather ) + value.value;
+			gather = float( sum );
+		}
+		else{
+			gather += float( value.value );
+		}
+	}
+	GatherOut out_;
+	out_.gather = gather;
+	out_.flags = flags;
+	pc.params.outs.o[ index ] = out_;
+}
+
+/* -------------------------------------------------------------------------------
+
+   direct lighting of raw lightmaps (IlluminateRawLightmap()'s light loop): for a lightmap and a list
+   of lights, the initial one-sample-per-luxel pass, the adaptive 2x2 supersampling and the
+   accumulation in light order, like IlluminateRawLightmapLight() / AccumulateRawLightmapLight() do
+
+   ------------------------------------------------------------------------------- */
+
+/* float division and square root, correctly rounded like the CPU's */
+float FDiv( float a, float b ){
+	if ( ( pc.debugMode & DEBUG_FLOAT_MATH ) != 0 ) {
+		return a / b;
+	}
+	return float( DivRN( double( a ), double( b ) ) );
+}
+
+float FSqrt( float a ){
+	if ( ( pc.debugMode & DEBUG_FLOAT_MATH ) != 0 ) {
+		return sqrt( a );
+	}
+	return float( SqrtRN( double( a ) ) );
+}
+
+/* VectorNormalize(): in double, returns the length */
+float Normalize( inout vec3 v ){
+	if ( ( pc.debugMode & DEBUG_FLOAT_MATH ) != 0 ) {
+		const float l = sqrt( Dot( v, v ) );
+		if ( l == 0 ) {
+			v = vec3( 0 );
+			return 0;
+		}
+		v = v / l;
+		return l;
+	}
+	const dvec3 d = dvec3( v );
+	precise double lengthSquared = d.x * d.x + d.y * d.y + d.z * d.z;
+	const double length = SqrtRN( lengthSquared );
+	if ( length == 0 ) {
+		v = vec3( 0 );
+		return 0;
+	}
+	v = vec3( DivRN( d.x, length ), DivRN( d.y, length ), DivRN( d.z, length ) );
+	return float( length );
+}
+
+/* SetupTrace() for a light ray: the r* globals */
+float SetupLightTrace( vec3 origin, vec3 end ){
+	rOrigin = origin;
+	rEnd = end;
+	precise vec3 displacement = end - origin;
+	rDirection = displacement;
+	rDistance = Normalize( rDirection );
+	return rDistance;
+}
+
+/* ELightType */
+const int LIGHT_POINT = 0;
+const int LIGHT_AREA = 1;
+const int LIGHT_SPOT = 2;
+const int LIGHT_SUN = 3;
+
+/* LightFlags */
+const uint LF_ATTEN_LINEAR = 1u;
+const uint LF_ATTEN_ANGLE = 2u;
+const uint LF_TWOSIDED = 8u;
+const uint LF_SURFACES = 32u;
+const uint LF_FAST_ACTUAL = 128u | 256u;
+const uint LF_NEGATIVE = 512u;
+
+const int CLUSTER_NORMAL = 0;
+const int CLUSTER_UNMAPPED = -1;
+const int CLUSTER_OPAQUE = -1;
+const float LUXEL_EPSILON = 0.125;
+const uint FLAG_FORCE_SUBSAMPLING = 1u;
+const uint FLAG_ALREADY_SUBSAMPLED = 2u;
+/* supersampling on the GPU: the stamp at this luxel may subsample (with the initial pass values),
+   a luxel of it changed, the luxel is subsampled ahead, the row has stamps to visit */
+const uint FLAG_STAMP = 4u;
+const uint FLAG_STAMP_CHANGED = 8u;
+const uint FLAG_CANDIDATE = 16u;
+const uint FLAG_ROW = 32u;
+const uint FLAG_VALID = 64u;                    /* tmp holds the luxel; else it has no light (the initial pass state) */
+
+/* ClusterVisible() */
+bool ClusterVisible( int a, int b ){
+	if ( a < CLUSTER_NORMAL || b < CLUSTER_NORMAL ) {
+		return false;
+	}
+	if ( a == b ) {
+		return true;
+	}
+	if ( pc.world.hasVis == 0 ) {
+		return true;
+	}
+	const int byteIndex = 8 + a * pc.world.leafBytes + ( b >> 3 );
+	const uint byteValue = ( pc.world.vis.u[ byteIndex >> 2 ] >> ( ( byteIndex & 3 ) * 8 ) ) & 0xffu;
+	return ( byteValue & ( 1u << uint( b & 7 ) ) ) != 0;
+}
+
+/* plane3_distance_to_point() of a bsp plane: float dot, in double */
+double BspPlaneDistance( int planeNum, vec3 p ){
+	const vec4 plane = pc.world.planes.v[ planeNum ];
+	precise float dot = p.x * plane.x + p.y * plane.y + p.z * plane.z;
+	precise double d = double( dot ) - double( plane.w );
+	return d;
+}
+
+/* PointInLeafNum_r(): on a plane, the front side unless it ends in an opaque leaf */
+int PointInLeafNum( vec3 point ){
+	int stack[ 64 ];
+	int sp = 0;
+	int nodenum = 0;
+	for ( ;; )
+	{
+		while ( nodenum >= 0 )
+		{
+			const BspNode node = pc.world.nodes.n[ nodenum ];
+			const double dist = BspPlaneDistance( node.planeNum, point );
+			if ( dist > 0.1 ) {
+				nodenum = node.child0;
+			}
+			else if ( dist < -0.1 ) {
+				nodenum = node.child1;
+			}
+			else
+			{
+				if ( sp < 64 ) {
+					stack[ sp++ ] = node.child1;
+				}
+				nodenum = node.child0;
+			}
+		}
+		const int leafnum = -nodenum - 1;
+		if ( sp == 0 || pc.world.leafs.l[ leafnum ].cluster != CLUSTER_OPAQUE ) {
+			return leafnum;
+		}
+		nodenum = stack[ --sp ];
+	}
+}
+
+/* ClusterForPointExt(): opaque brushes in the leaf count as opaque */
+int ClusterForPointExt( vec3 point, float epsilon ){
+	const int leafNum = PointInLeafNum( point );
+	if ( leafNum < 0 ) {
+		return CLUSTER_OPAQUE;
+	}
+	const BspLeaf leaf = pc.world.leafs.l[ leafNum ];
+	if ( leaf.cluster <= CLUSTER_OPAQUE ) {
+		return CLUSTER_OPAQUE;
+	}
+	for ( int i = 0; i < leaf.numBrushes; ++i )
+	{
+		const int b = pc.world.leafBrushes.i[ leaf.firstBrush + i ];
+		if ( b >= pc.world.numOpaque || pc.world.opaque.u[ b ] == 0 ) {
+			continue;
+		}
+		const ivec2 brush = pc.world.brushes.p[ b ];
+		bool inside = true;
+		for ( int s = 0; s < brush.y; ++s )
+		{
+			if ( BspPlaneDistance( pc.world.sides.i[ brush.x + s ], point ) > double( epsilon ) ) {
+				inside = false;
+				break;
+			}
+		}
+		if ( inside ) {
+			return CLUSTER_OPAQUE - b;
+		}
+	}
+	return leaf.cluster;
+}
+
+/* ClusterForPointExtFilter() with the lightmap's clusters */
+int ClusterForPointExtFilter( vec3 point, float epsilon ){
+	const int cluster = ClusterForPointExt( point, epsilon );
+	const int numClusters = pc.job.numLightClusters;
+	if ( cluster <= CLUSTER_OPAQUE || numClusters <= 0 ) {
+		return cluster;
+	}
+	for ( int i = 0; i < numClusters; ++i )
+	{
+		const int c = pc.job.lightClusters.i[ i ];
+		if ( cluster == c || ClusterVisible( cluster, c ) ) {
+			return cluster;
+		}
+	}
+	return CLUSTER_OPAQUE;
+}
+
+Luxel GetLuxel( int x, int y ){
+	return pc.job.luxels.x[ y * pc.job.sw + x ];
+}
+
+int LuxelCluster( int x, int y ){
+	/* the CPU code may look one luxel outside a lightmap one luxel wide or high: unmapped */
+	if ( x < 0 || y < 0 || x >= pc.job.sw || y >= pc.job.sh ) {
+		return CLUSTER_UNMAPPED;
+	}
+	return floatBitsToInt( pc.job.luxels.x[ y * pc.job.sw + x ].originCluster.w );
+}
+
+/* SubmapRawLuxel(): the cluster and origin of a sub-luxel (its normal is the luxel's) */
+bool SubmapRawLuxel( int x, int y, float bx, float by, out int sampleCluster, inout vec3 sampleOrigin ){
+	const int sw = pc.job.sw, sh = pc.job.sh;
+	vec3 origin = vec3( 0 ), origin2 = vec3( 0 );
+
+	/* x vector */
+	if ( ( x < ( sw - 1 ) && bx >= 0 ) || ( x == 0 && bx <= 0 ) ) {
+		origin = GetLuxel( x, y ).originCluster.xyz;
+		origin2 = LuxelCluster( x + 1, y ) < CLUSTER_NORMAL ? origin : GetLuxel( x + 1, y ).originCluster.xyz;
+	}
+	else if ( ( x > 0 && bx <= 0 ) || ( x == ( sw - 1 ) && bx >= 0 ) ) {
+		origin2 = GetLuxel( x, y ).originCluster.xyz;
+		origin = LuxelCluster( x - 1, y ) < CLUSTER_NORMAL ? origin2 : GetLuxel( x - 1, y ).originCluster.xyz;
+	}
+	precise vec3 vec0 = origin2 - origin;
+
+	/* y vector (bx, as in the CPU code) */
+	if ( ( y < ( sh - 1 ) && bx >= 0 ) || ( y == 0 && bx <= 0 ) ) {
+		origin = GetLuxel( x, y ).originCluster.xyz;
+		origin2 = LuxelCluster( x, y + 1 ) < CLUSTER_NORMAL ? origin : GetLuxel( x, y + 1 ).originCluster.xyz;
+	}
+	else if ( ( y > 0 && bx <= 0 ) || ( y == ( sh - 1 ) && bx >= 0 ) ) {
+		origin2 = GetLuxel( x, y ).originCluster.xyz;
+		origin = LuxelCluster( x, y - 1 ) < CLUSTER_NORMAL ? origin2 : GetLuxel( x, y - 1 ).originCluster.xyz;
+	}
+	precise vec3 vec1 = origin2 - origin;
+
+	precise vec3 offset = ( vec0 * bx ) + ( vec1 * by );
+	sampleOrigin = sampleOrigin + offset;
+
+	sampleCluster = ( pc.debugMode & DEBUG_NO_BSP_CLUSTER ) != 0 ? LuxelCluster( x, y ) : ClusterForPointExtFilter( sampleOrigin, LUXEL_EPSILON * 2 );
+	return sampleCluster > CLUSTER_OPAQUE;
+}
+
+/* PointToPolygonFormFactor() (acos in float: GLSL has no double acos) */
+float PointToPolygonFormFactor( vec3 point, vec3 normal, int offset, int count ){
+	double total = 0;
+	vec3 first = pc.job.windings.v[ offset ].xyz - point;
+	Normalize( first );
+	vec3 current = first;
+	for ( int i = 0; i < count; ++i )
+	{
+		vec3 next = first;
+		if ( i + 1 < count ) {
+			next = pc.job.windings.v[ offset + i + 1 ].xyz - point;
+			Normalize( next );
+		}
+		vec3 triNormal = Cross( current, next );
+		if ( Normalize( triNormal ) < 0.0001 ) {
+			current = next;
+			continue;
+		}
+		const float dot = Dot( current, next );
+		const double angle = double( acos( clamp( dot, -1.0, 1.0 ) ) );
+		const double facing = double( Dot( normal, triNormal ) );
+		precise double add = facing * angle;
+		total += add;
+		if ( total > 6.3LF || total < -6.3LF ) {
+			return 0;
+		}
+		current = next;
+	}
+	precise double result = total * ( 1.0LF / 6.283185307179586476925286766559LF );
+	return float( result );
+}
+
+/* the trace setup shared by the light rays of a lightmap */
+void SetupLightRay( Light light, bool testAll ){
+	rInhibit = 1.5;                             /* DEFAULT_INHIBIT_RADIUS */
+	rRecvShadows = pc.job.recvShadows;
+	rLightSky = pc.job.oneSky == 0 ? light.misc.y : -1;
+	rSurfacesOffset = 0;
+	rNumSurfaces = pc.job.numSurfaces;
+	rFlags = pc.job.rayFlags | ( testAll ? GPU_RAY_TEST_ALL : 0u );
+	if ( rRecvShadows == 0 || pc.job.testOcclusion == 0 || rDistance <= 0.00001 ) {
+		rFlags |= GPU_RAY_SKIP;
+	}
+}
+
+/* LightContributionToSample() without deluxemaps: color and forceSubsampling */
+void LightContribution( Light light, vec3 origin, vec3 normal, int cluster, out vec3 color, out float forceSubsampling ){
+	color = vec3( 0 );
+	forceSubsampling = 0;
+
+	const uint flags = floatBitsToUint( light.p2.w );
+	const int type = floatBitsToInt( light.originType.w );
+	const vec3 lightOrigin = light.originType.xyz;
+	const vec3 lightNormal = light.normalDist.xyz;
+	const float envelope = light.p2.y;
+	const bool twoSided = pc.job.twoSided != 0;
+
+	if ( ( flags & LF_SURFACES ) == 0 || envelope <= 0 ) {
+		return;
+	}
+
+	if ( type != LIGHT_SUN ) {
+		if ( !twoSided ) {
+			if ( Dot( lightOrigin, normal ) < Dot( origin, normal ) ) {
+				return;
+			}
+		}
+		if ( !ClusterVisible( cluster, light.misc.x ) ) {
+			return;
+		}
+		/* surely at or beyond the envelope (the exact test is after SetupTrace()) */
+		precise vec3 toLight = lightOrigin - origin;
+		if ( Dot( toLight, toLight ) > envelope * envelope * 1.0001 + 1.0 ) {
+			return;
+		}
+	}
+
+	float add = 0;
+	float dist;
+	if ( type == LIGHT_AREA ) {
+		precise float d = Dot( origin, lightNormal ) - light.normalDist.w;
+		if ( d < 3.0 ) {
+			if ( ( flags & LF_TWOSIDED ) == 0 && d < -1 ) {
+				return;
+			}
+			if ( d > -3.0 && Dot( normal, lightNormal ) > 0.9 ) {
+				return;
+			}
+		}
+		vec3 pushedOrigin = origin;
+		if ( d > -8.0 && d < 8.0 ) {
+			precise vec3 pushed = origin + lightNormal * ( 8.0 - d );
+			pushedOrigin = pushed;
+		}
+
+		dist = SetupLightTrace( origin, lightOrigin );
+		if ( dist >= envelope ) {
+			return;
+		}
+
+		if ( pc.job.faster != 0 ) {
+			precise float angle = Dot( normal, rDirection );
+			if ( twoSided && angle < 0 ) {
+				angle = -angle;
+			}
+			angle *= -Dot( lightNormal, rDirection );
+			if ( angle == 0 ) {
+				return;
+			}
+			else if ( angle < 0 && ( twoSided || ( flags & LF_TWOSIDED ) != 0 ) ) {
+				angle = -angle;
+			}
+			precise float extra = dist * dist + light.p1.w * light.p1.w;
+			dist = max( 16.0, FSqrt( extra ) );
+			precise float a = FDiv( light.colorPhotons.w, dist * dist ) * angle;
+			add = a;
+		}
+		else
+		{
+			float factor = PointToPolygonFormFactor( pushedOrigin, normal, light.misc.z, light.misc.w );
+			if ( factor == 0 ) {
+				return;
+			}
+			else if ( factor < 0 ) {
+				if ( twoSided || ( flags & LF_TWOSIDED ) != 0 ) {
+					factor = -factor;
+					precise vec3 end = lightOrigin - lightNormal * 2.0;
+					dist = SetupLightTrace( origin, end );
+					if ( dist >= envelope ) {
+						return;
+					}
+				}
+				else{
+					return;
+				}
+			}
+			precise float a = factor * light.p2.x;
+			add = a;
+		}
+	}
+	else if ( type == LIGHT_POINT || type == LIGHT_SPOT ) {
+		dist = SetupLightTrace( origin, lightOrigin );
+		if ( dist >= envelope ) {
+			return;
+		}
+		precise float extra = dist * dist + light.p1.w * light.p1.w;
+		dist = max( 16.0, FSqrt( extra ) );
+
+		precise float angle = 1;
+		if ( ( flags & LF_ATTEN_ANGLE ) != 0 ) {
+			precise float dot = Dot( normal, rDirection );
+			if ( twoSided && dot < 0 ) {
+				dot = -dot;
+			}
+			if ( pc.job.lightAngleHL != 0 ) {
+				if ( dot > 0.001 ) {
+					dot = min( dot, 1.0 );
+					dot = ( dot * 0.5 ) + 0.5;
+					dot *= dot;
+				}
+				else{
+					dot = 0;
+				}
+			}
+			angle = dot;
+		}
+		if ( light.p1.z != 0 ) {
+			angle = FDiv( angle, light.p1.z );
+			angle = min( angle, 1.0 );
+		}
+
+		if ( ( flags & LF_ATTEN_LINEAR ) != 0 ) {
+			precise float a = angle * light.colorPhotons.w * pc.job.linearScale - ( dist * light.p1.y );
+			add = max( 0.0, a );
+		}
+		else{
+			precise float a = FDiv( light.colorPhotons.w, dist * dist ) * angle;
+			add = max( 0.0, a );
+		}
+
+		if ( type == LIGHT_SPOT ) {
+			precise vec3 displacement = rEnd - rOrigin;
+			const float distByNormal = -Dot( displacement, lightNormal );
+			if ( distByNormal < 0 ) {
+				return;
+			}
+			precise vec3 pointAtDist = lightOrigin + lightNormal * distByNormal;
+			precise float radiusAtDist = light.p1.x * distByNormal;
+			precise vec3 distToSample = origin - pointAtDist;
+			const float sampleRadius = FSqrt( Dot( distToSample, distToSample ) );
+			if ( sampleRadius >= radiusAtDist ) {
+				return;
+			}
+			if ( sampleRadius > ( radiusAtDist - 32.0 ) ) {
+				add *= FDiv( radiusAtDist - sampleRadius, 32.0 );
+				add = max( add, 0.0 );
+			}
+		}
+	}
+	else if ( type == LIGHT_SUN ) {
+		precise vec3 end = origin + lightOrigin;
+		dist = SetupLightTrace( origin, end );
+
+		precise float angle = 1;
+		if ( ( flags & LF_ATTEN_ANGLE ) != 0 ) {
+			precise float dot = Dot( normal, rDirection );
+			if ( twoSided && dot < 0 ) {
+				dot = -dot;
+			}
+			if ( pc.job.lightAngleHL != 0 ) {
+				if ( dot > 0.001 ) {
+					dot = min( dot, 1.0 );
+					dot = ( dot * 0.5 ) + 0.5;
+					dot *= dot;
+				}
+				else{
+					dot = 0;
+				}
+			}
+			angle = dot;
+		}
+		precise float a = light.colorPhotons.w * angle;
+		add = a;
+		if ( add <= 0 ) {
+			return;
+		}
+
+		precise vec3 c = light.colorPhotons.xyz * add;
+		color = c;
+		if ( pc.job.testOcclusion != 0 ) {
+			SetupLightRay( light, true );
+			vec3 hitPoint, traced;
+			float hitDepth;
+			uint compileFlags, status, skyBits;
+			Trace( color, hitPoint, hitDepth, traced, compileFlags, status, skyBits );
+			if ( ( status & GPU_HIT_OVERFLOW ) != 0 ) {
+				atomicAdd( pc.job.counters.c[ ( status & GPU_HIT_SOLID_OVERFLOW ) != 0 ? 1 : 0 ], 1u );
+			}
+			color = traced;
+			forceSubsampling = ( ( status & GPU_HIT_FORCE_SUBSAMPLING ) != 0 ? 1.0 : 0.0 ) * add;
+			const int skyIndex = light.misc.y;
+			if ( ( compileFlags & pc.skyFlag ) == 0 || ( status & GPU_HIT_OPAQUE ) != 0
+			  || ( pc.job.oneSky == 0 && skyIndex != -1 && ( skyBits & ( 1u << uint( skyIndex ) ) ) == 0 ) ) {
+				color = vec3( 0 );
+			}
+		}
+		return;
+	}
+
+	if ( add <= 0 || ( add <= light.p2.z && ( flags & LF_FAST_ACTUAL ) != 0 ) ) {
+		return;
+	}
+
+	precise vec3 c = light.colorPhotons.xyz * add;
+	SetupLightRay( light, false );
+	vec3 hitPoint, traced;
+	float hitDepth;
+	uint compileFlags, status, skyBits;
+	Trace( c, hitPoint, hitDepth, traced, compileFlags, status, skyBits );
+	if ( ( status & GPU_HIT_OVERFLOW ) != 0 ) {
+		atomicAdd( pc.job.counters.c[ ( status & GPU_HIT_SOLID_OVERFLOW ) != 0 ? 1 : 0 ], 1u );
+	}
+	forceSubsampling = ( ( status & GPU_HIT_FORCE_SUBSAMPLING ) != 0 ? 1.0 : 0.0 ) * add;
+	color = ( status & ( GPU_HIT_PASS_SOLID | GPU_HIT_OPAQUE ) ) != 0 ? vec3( 0 ) : traced;
+}
+
+/* the job light a tmp index belongs to */
+int JobLightForTmp( uint index ){
+	int lo = 0, hi = pc.job.numJobLights - 1;
+	while ( lo < hi )
+	{
+		const int mid = ( lo + hi + 1 ) / 2;
+		if ( uint( pc.job.jobLights.j[ mid ].a.y ) <= index ) {
+			lo = mid;
+		}
+		else{
+			hi = mid - 1;
+		}
+	}
+	return lo;
+}
+
+/* GpuJobLight: a = light, tmpOffset, ax0, ay0; b = aw, ah, rx0, ry0; c = rx1, ry1, filterRadius, negative */
+uint TmpIndex( JobLight jl, int x, int y ){
+	return uint( jl.a.y + ( y - jl.a.w ) * jl.b.x + ( x - jl.a.z ) );
+}
+
+bool InArea( JobLight jl, int x, int y ){
+	return x >= jl.a.z && y >= jl.a.w && x < jl.a.z + jl.b.x && y < jl.a.w + jl.b.y;
+}
+
+/* the per-light luxel, or the initial pass state of a luxel without light */
+vec4 TmpValue( uint i, int x, int y ){
+	if ( ( pc.job.flags.f[ i ] & FLAG_VALID ) != 0 ) {
+		return pc.job.tmp.t[ i ];
+	}
+	return vec4( 0, 0, 0, LuxelCluster( x, y ) >= CLUSTER_NORMAL ? 1 : 0 );
+}
+
+/* the work item of a workgroup: a job light and one of its region's tiles */
+ivec4 WorkItem(){
+	return pc.job.items.t[ gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x ];
+}
+
+/* the initial pass: one sample per luxel, a workgroup per tile of a light's region */
+void LightInitial(){
+	const ivec4 item = WorkItem();
+	const JobLight jl = pc.job.jobLights.j[ item.x ];
+	const Light light = pc.job.lights.l[ jl.a.x ];
+	for ( uint k = gl_LocalInvocationID.x; k < 256; k += gl_WorkGroupSize.x )
+	{
+		const int x = item.y * 16 + int( k % 16 ), y = item.z * 16 + int( k / 16 );
+		if ( x >= pc.job.sw || y >= pc.job.sh ) {
+			continue;
+		}
+		const Luxel luxel = GetLuxel( x, y );
+		const int cluster = floatBitsToInt( luxel.originCluster.w );
+		vec4 value = vec4( 0, 0, 0, cluster >= CLUSTER_NORMAL ? 1 : 0 );
+		uint flag = FLAG_VALID;
+		if ( cluster >= CLUSTER_NORMAL ) {
+			vec3 color;
+			float forceSubsampling;
+			LightContribution( light, luxel.originCluster.xyz, luxel.normal.xyz, cluster, color, forceSubsampling );
+			value.xyz = color;
+			if ( forceSubsampling > 1 && pc.job.lightSamples > 1 ) {
+				flag |= FLAG_FORCE_SUBSAMPLING;
+			}
+		}
+		const uint index = TmpIndex( jl, x, y );
+		pc.job.tmp.t[ index ] = value;
+		pc.job.flags.f[ index ] = flag;
+	}
+}
+
+/* SubsampleRawLuxel_r() without recursion: a stack of 2x2 stamps */
+const int MAX_SUBSAMPLE_DEPTH = 4;
+
+struct SubFrame
+{
+	vec3 origin[ 4 ];
+	vec3 value[ 4 ];
+	float count[ 4 ];
+	int cluster[ 4 ];
+	vec3 sampleValue;                           /* the luxel being subsampled */
+	float sampleCount;
+	float bias;
+	int next;                                   /* next sub-luxel to subsample further, 4 = done */
+	int slot;                                   /* where the result goes in the parent frame */
+};
+
+/* makes the 2x2 stamp of a frame; false: the luxel has enough samples */
+bool SubsampleStamp( inout SubFrame f, Light light, int x, int y, vec3 sampleOrigin, vec3 normal ){
+	const vec2 biasDirs[ 4 ] = vec2[]( vec2( -1, -1 ), vec2( 1, -1 ), vec2( -1, 1 ), vec2( 1, 1 ) );
+	if ( f.sampleCount >= float( pc.job.lightSamples ) ) {
+		return false;
+	}
+	int mapped = 0, lighted = 0;
+	precise vec3 total = vec3( 0 );
+	for ( int b = 0; b < 4; ++b )
+	{
+		f.origin[ b ] = sampleOrigin;
+		int cluster;
+		vec3 origin = sampleOrigin;
+		precise float bx = f.bias * biasDirs[ b ].x;
+		precise float by = f.bias * biasDirs[ b ].y;
+		const bool ok = SubmapRawLuxel( x, y, bx, by, cluster, origin );
+		f.cluster[ b ] = cluster;
+		f.origin[ b ] = origin;
+		if ( !ok ) {
+			f.cluster[ b ] = CLUSTER_UNMAPPED;
+			continue;
+		}
+		mapped++;
+		f.count[ b ] = f.sampleCount + 1;
+
+		/* the CPU code uses the first sub-luxel's cluster for all of them */
+		vec3 color;
+		float forceSubsampling;
+		LightContribution( light, origin, normal, f.cluster[ 0 ], color, forceSubsampling );
+		if ( forceSubsampling > 1 ) {
+			++lighted;
+			++mapped;
+			++mapped;
+		}
+		f.value[ b ] = color;
+		total += color;
+		precise float sum = color.x + color.y + color.z;
+		if ( sum > 0 ) {
+			lighted++;
+		}
+	}
+	f.next = ( ( f.sampleCount + 1 ) < float( pc.job.lightSamples ) &&
+	           ( total.x > 4.0 || total.y > 4.0 || total.z > 4.0 ) &&
+	           lighted != 0 && lighted != mapped ) ? 0 : 4;
+	return true;
+}
+
+/* the frame's luxel averaged with its sub-luxels */
+void SubsampleAverage( inout SubFrame f ){
+	precise vec3 color = f.sampleValue;
+	int samples = 1;
+	for ( int b = 0; b < 4; ++b )
+	{
+		if ( f.cluster[ b ] < CLUSTER_NORMAL ) {
+			continue;
+		}
+		color += f.value[ b ];
+		samples++;
+	}
+	f.sampleValue = vec3( FDiv( color.x, float( samples ) ), FDiv( color.y, float( samples ) ), FDiv( color.z, float( samples ) ) );
+	f.sampleCount += 1;
+}
+
+void SubsampleLuxel( Light light, int x, int y, vec3 sampleOrigin, float bias, inout vec4 lightLuxel ){
+	const vec3 normal = GetLuxel( x, y ).normal.xyz;
+	SubFrame stack[ MAX_SUBSAMPLE_DEPTH ];
+	int depth = 0;
+	stack[ 0 ].sampleValue = lightLuxel.xyz;
+	stack[ 0 ].sampleCount = lightLuxel.w;
+	stack[ 0 ].bias = bias;
+	stack[ 0 ].slot = 0;
+	if ( !SubsampleStamp( stack[ 0 ], light, x, y, sampleOrigin, normal ) ) {
+		return;
+	}
+	for ( ;; )
+	{
+		if ( stack[ depth ].next < 4 ) {
+			const int b = stack[ depth ].next++;
+			if ( stack[ depth ].cluster[ b ] < CLUSTER_NORMAL || depth + 1 >= MAX_SUBSAMPLE_DEPTH ) {
+				continue;
+			}
+			SubFrame child;
+			child.sampleValue = stack[ depth ].value[ b ];
+			child.sampleCount = stack[ depth ].count[ b ];
+			child.bias = stack[ depth ].bias * 0.5;
+			child.slot = b;
+			if ( SubsampleStamp( child, light, x, y, stack[ depth ].origin[ b ], normal ) ) {
+				stack[ ++depth ] = child;
+			}
+			continue;
+		}
+		SubsampleAverage( stack[ depth ] );
+		if ( depth == 0 ) {
+			lightLuxel = vec4( stack[ 0 ].sampleValue, stack[ 0 ].sampleCount );
+			return;
+		}
+		const int slot = stack[ depth ].slot;
+		stack[ depth - 1 ].value[ slot ] = stack[ depth ].sampleValue;
+		stack[ depth - 1 ].count[ slot ] = stack[ depth ].sampleCount;
+		--depth;
+	}
+}
+
+/* the stamp range of a light (IlluminateRawLightmapLight() with a region) */
+void StampRange( JobLight jl, out int stampX0, out int stampY0, out int stampX1, out int stampY1 ){
+	stampX0 = max( 0, jl.b.z - 1 );
+	stampY0 = max( 0, jl.b.w - 1 );
+	stampX1 = min( pc.job.sw - 1, jl.c.x );
+	stampY1 = min( pc.job.sh - 1, jl.c.y );
+}
+
+/* the stamp diagonals of a light (x + 2y from its first stamp) with stamps to visit */
+void SetStampDiagonal( JobLight jl, int x, int y ){
+	const uint k = uint( ( x - max( 0, jl.b.z - 1 ) ) + 2 * ( y - max( 0, jl.b.w - 1 ) ) );
+	atomicOr( pc.job.diagonals.f[ uint( jl.d.z ) + k / 32 ], 1u << ( k % 32 ) );
+}
+
+/* supersampling, step 1: the stamps that subsample with the initial pass values, and their luxels */
+void MarkStamp( uint j, JobLight jl, int x, int y ){
+	const ivec2 tests[ 4 ] = ivec2[]( ivec2( 0, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ) );
+	int mapped = 0, lighted = 0;
+	precise vec3 total = vec3( 0 );
+	for ( int t = 0; t < 4; ++t )
+	{
+		const int sx = x + tests[ t ].x, sy = y + tests[ t ].y;
+		if ( LuxelCluster( sx, sy ) < CLUSTER_NORMAL ) {
+			continue;
+		}
+		mapped++;
+		const uint i = TmpIndex( jl, sx, sy );
+		if ( ( pc.job.flags.f[ i ] & FLAG_FORCE_SUBSAMPLING ) != 0 ) {
+			++lighted;
+			++mapped;
+			++mapped;
+		}
+		const vec3 value = TmpValue( i, sx, sy ).xyz;
+		total += value;
+		precise float sum = value.x + value.y + value.z;
+		if ( sum > 0 ) {
+			lighted++;
+		}
+	}
+	if ( ( total.x <= 4.0 && total.y <= 4.0 && total.z <= 4.0 ) || lighted == 0 || lighted == mapped ) {
+		return;
+	}
+	atomicOr( pc.job.flags.f[ TmpIndex( jl, x, y ) ], FLAG_STAMP );
+	SetStampDiagonal( jl, x, y );
+	atomicOr( pc.job.flags.f[ TmpIndex( jl, jl.a.z, y ) ], FLAG_ROW );
+	/* the stamp's luxels, and those of the stamps around it, which its subsampling may make subsample */
+	for ( int sy = y - 1; sy <= y + 2; ++sy )
+	{
+		for ( int sx = x - 1; sx <= x + 2; ++sx )
+		{
+			if ( InArea( jl, sx, sy ) && LuxelCluster( sx, sy ) >= CLUSTER_NORMAL ) {
+				const uint i = TmpIndex( jl, sx, sy );
+				if ( ( atomicOr( pc.job.flags.f[ i ], FLAG_CANDIDATE ) & FLAG_CANDIDATE ) == 0 ) {
+					pc.job.candidates.c[ atomicAdd( pc.job.counters.c[ 3 ], 1u ) ] = uvec2( i, j );
+				}
+			}
+		}
+	}
+}
+
+/* the stamps from a luxel before a tile of the light's region to its last luxel, a workgroup per tile */
+void LightMark(){
+	const ivec4 item = WorkItem();
+	const JobLight jl = pc.job.jobLights.j[ item.x ];
+	int stampX0, stampY0, stampX1, stampY1;
+	StampRange( jl, stampX0, stampY0, stampX1, stampY1 );
+	for ( uint k = gl_LocalInvocationID.x; k < 17 * 17; k += gl_WorkGroupSize.x )
+	{
+		const int x = item.y * 16 - 1 + int( k % 17 ), y = item.z * 16 - 1 + int( k / 17 );
+		if ( x >= stampX0 && y >= stampY0 && x < stampX1 && y < stampY1 ) {
+			MarkStamp( uint( item.x ), jl, x, y );
+		}
+	}
+}
+
+/* the size of a round's subsampling dispatch: the candidates added since the previous round */
+void LightArgs(){
+	if ( gl_GlobalInvocationID.x == 0 ) {
+		const uint begin = pc.job.counters.c[ 5 ], end = pc.job.counters.c[ 3 ];
+		pc.job.counters.c[ 4 ] = begin;
+		pc.job.counters.c[ 5 ] = end;
+		pc.job.dispatchArgs.c[ 0 ] = ( end - begin + 255 ) / 256;
+		pc.job.dispatchArgs.c[ 1 ] = 1;
+		pc.job.dispatchArgs.c[ 2 ] = 1;
+	}
+}
+
+/* supersampling, step 2: the candidate luxels subsampled ahead; a luxel's subsampling depends only on
+   its own initial pass value, so this is what the CPU gets when it subsamples the luxel */
+void LightSubsample(){
+	const uint n = pc.job.counters.c[ 4 ] + gl_GlobalInvocationID.x;
+	if ( n >= pc.job.counters.c[ 5 ] ) {
+		return;
+	}
+	const uvec2 candidate = pc.job.candidates.c[ n ];
+	const uint index = candidate.x;
+	const JobLight jl = pc.job.jobLights.j[ candidate.y ];
+	const int local = int( index ) - jl.a.y;
+	const int x = jl.a.z + local % jl.b.x;
+	const int y = jl.a.w + local / jl.b.x;
+	vec4 lightLuxel = TmpValue( index, x, y );
+	if ( ( pc.debugMode & DEBUG_NO_SUBSAMPLE ) == 0 ) {
+		SubsampleLuxel( pc.job.lights.l[ jl.a.x ], x, y, GetLuxel( x, y ).originCluster.xyz, 0.25 * float( pc.job.searchBoxSize ), lightLuxel );
+	}
+	pc.job.sub.t[ index ] = lightLuxel;
+}
+
+/* LightSupersample(): luxels the light's workgroup subsampled itself, and those a diagonal needs */
+shared uint walkSubsamplesShared;
+shared uint unpredictedShared;
+const uint RESUME_DONE = 0x7fffffffu;
+
+/* whether a 2x2 stamp subsamples its luxels, with their current values */
+bool StampSubsamples( JobLight jl, int x, int y ){
+	const ivec2 tests[ 4 ] = ivec2[]( ivec2( 0, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ) );
+	int mapped = 0, lighted = 0;
+	precise vec3 total = vec3( 0 );
+	for ( int t = 0; t < 4; ++t )
+	{
+		const int sx = x + tests[ t ].x, sy = y + tests[ t ].y;
+		if ( LuxelCluster( sx, sy ) < CLUSTER_NORMAL ) {
+			continue;
+		}
+		mapped++;
+		const uint i = TmpIndex( jl, sx, sy );
+		if ( ( pc.job.flags.f[ i ] & FLAG_FORCE_SUBSAMPLING ) != 0 ) {
+			++lighted;
+			++mapped;
+			++mapped;
+		}
+		const vec3 value = TmpValue( i, sx, sy ).xyz;
+		total += value;
+		precise float sum = value.x + value.y + value.z;
+		if ( sum > 0 ) {
+			lighted++;
+		}
+	}
+	return !( total.x <= 4.0 && total.y <= 4.0 && total.z <= 4.0 ) && lighted != 0 && lighted != mapped;
+}
+
+/* the luxels a stamp would subsample that weren't subsampled ahead; append: they become candidates
+   of the next round */
+uint StampUnpredicted( uint j, JobLight jl, int x, int y, bool append ){
+	const ivec2 tests[ 4 ] = ivec2[]( ivec2( 0, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ) );
+	if ( !StampSubsamples( jl, x, y ) ) {
+		return 0;
+	}
+	uint n = 0;
+	for ( int t = 0; t < 4; ++t )
+	{
+		const int sx = x + tests[ t ].x, sy = y + tests[ t ].y;
+		if ( LuxelCluster( sx, sy ) < CLUSTER_NORMAL ) {
+			continue;
+		}
+		const uint i = TmpIndex( jl, sx, sy );
+		const uint flag = pc.job.flags.f[ i ];
+		if ( ( flag & ( FLAG_ALREADY_SUBSAMPLED | FLAG_CANDIDATE ) ) != 0 ) {
+			continue;
+		}
+		++n;
+		if ( append ) {
+			pc.job.flags.f[ i ] = flag | FLAG_CANDIDATE;
+			pc.job.candidates.c[ atomicAdd( pc.job.counters.c[ 3 ], 1u ) ] = uvec2( i, j );
+		}
+	}
+	return n;
+}
+
+/* one 2x2 stamp of the supersampling pass */
+void LightStamp( JobLight jl, Light light, int x, int y ){
+	const ivec2 tests[ 4 ] = ivec2[]( ivec2( 0, 0 ), ivec2( 1, 0 ), ivec2( 0, 1 ), ivec2( 1, 1 ) );
+	int mapped = 0, lighted = 0;
+	precise vec3 total = vec3( 0 );
+	for ( int t = 0; t < 4; ++t )
+	{
+		const int sx = x + tests[ t ].x, sy = y + tests[ t ].y;
+		if ( LuxelCluster( sx, sy ) < CLUSTER_NORMAL ) {
+			continue;
+		}
+		mapped++;
+		const uint i = TmpIndex( jl, sx, sy );
+		if ( ( pc.job.flags.f[ i ] & FLAG_FORCE_SUBSAMPLING ) != 0 ) {
+			++lighted;
+			++mapped;
+			++mapped;
+		}
+		const vec3 value = TmpValue( i, sx, sy ).xyz;
+		total += value;
+		precise float sum = value.x + value.y + value.z;
+		if ( sum > 0 ) {
+			lighted++;
+		}
+	}
+	if ( total.x <= 4.0 && total.y <= 4.0 && total.z <= 4.0 ) {
+		return;
+	}
+	if ( lighted != 0 && lighted != mapped ) {
+		for ( int t = 0; t < 4; ++t )
+		{
+			const int sx = x + tests[ t ].x, sy = y + tests[ t ].y;
+			if ( LuxelCluster( sx, sy ) < CLUSTER_NORMAL ) {
+				continue;
+			}
+			const uint i = TmpIndex( jl, sx, sy );
+			const uint flag = pc.job.flags.f[ i ];
+			if ( ( flag & FLAG_ALREADY_SUBSAMPLED ) != 0 ) {
+				continue;
+			}
+			vec4 lightLuxel;
+			if ( ( flag & FLAG_CANDIDATE ) != 0 ) {
+				lightLuxel = pc.job.sub.t[ i ];
+			}
+			else
+			{
+				/* a stamp the initial pass values didn't predict: a few here, else the CPU does the lightmap
+				   (one thread doing many would take too long) */
+				lightLuxel = TmpValue( i, sx, sy );
+				const uint inlineCount = atomicAdd( walkSubsamplesShared, 1u ) + 1;
+				if ( inlineCount > uint( pc.job.inlineBudget ) ) {
+					if ( inlineCount == uint( pc.job.inlineBudget ) + 1 ) {
+						atomicAdd( pc.job.counters.c[ 2 ], 1u );
+					}
+				}
+				else if ( ( pc.debugMode & DEBUG_NO_SUBSAMPLE ) == 0 ) {
+					SubsampleLuxel( light, sx, sy, GetLuxel( sx, sy ).originCluster.xyz, 0.25 * float( pc.job.searchBoxSize ), lightLuxel );
+				}
+			}
+			pc.job.tmp.t[ i ] = lightLuxel;
+			pc.job.flags.f[ i ] = flag | FLAG_ALREADY_SUBSAMPLED | FLAG_VALID;
+
+			/* the later stamps with this luxel decide again */
+			for ( int s = 0; s < 4; ++s )
+			{
+				const int ox = sx - tests[ s ].x, oy = sy - tests[ s ].y;
+				if ( oy < y || ( oy == y && ox <= x ) ) {
+					continue;
+				}
+				int stampX0, stampY0, stampX1, stampY1;
+				StampRange( jl, stampX0, stampY0, stampX1, stampY1 );
+				if ( ox < stampX0 || oy < stampY0 || ox >= stampX1 || oy >= stampY1 ) {
+					continue;
+				}
+				pc.job.flags.f[ TmpIndex( jl, ox, oy ) ] |= FLAG_STAMP_CHANGED;
+				pc.job.flags.f[ TmpIndex( jl, jl.a.z, oy ) ] |= FLAG_ROW;
+				SetStampDiagonal( jl, ox, oy );
+			}
+		}
+	}
+}
+
+/* supersampling, step 3: a thread per light visits the stamps that may subsample in the CPU's order */
+void LightWalk(){
+	if ( ( pc.debugMode & DEBUG_NO_SUPERSAMPLE ) != 0 || gl_GlobalInvocationID.x >= uint( pc.job.numJobLights ) ) {
+		return;
+	}
+	const JobLight jl = pc.job.jobLights.j[ gl_GlobalInvocationID.x ];
+	const Light light = pc.job.lights.l[ jl.a.x ];
+	int stampX0, stampY0, stampX1, stampY1;
+	StampRange( jl, stampX0, stampY0, stampX1, stampY1 );
+	for ( int y = stampY0; y < stampY1; ++y )
+	{
+		if ( ( pc.job.flags.f[ TmpIndex( jl, jl.a.z, y ) ] & FLAG_ROW ) == 0 ) {
+			continue;
+		}
+		for ( int x = stampX0; x < stampX1; ++x )
+		{
+			if ( ( pc.job.flags.f[ TmpIndex( jl, x, y ) ] & ( FLAG_STAMP | FLAG_STAMP_CHANGED ) ) != 0 ) {
+				LightStamp( jl, light, x, y );
+			}
+		}
+	}
+}
+
+/* the first diagonal from k on with stamps to visit (all the workgroup's threads call it) */
+shared int nextDiagonalShared;
+int NextStampDiagonal( JobLight jl, int k, int diagonals ){
+	if ( gl_LocalInvocationID.x == 0 ) {
+		while ( k < diagonals )
+		{
+			const uint bits = pc.job.diagonals.f[ uint( jl.d.z ) + uint( k ) / 32 ] >> ( uint( k ) % 32 );
+			if ( bits != 0 ) {
+				k += findLSB( bits );
+				break;
+			}
+			k = ( k / 32 + 1 ) * 32;
+		}
+		nextDiagonalShared = min( k, diagonals );
+	}
+	barrier();
+	return nextDiagonalShared;
+}
+
+/* supersampling, step 3: the stamps of one light (a workgroup) in diagonals x + 2y, which keeps the
+   CPU's row by row order for the stamps sharing luxels; the luxels were subsampled ahead. a diagonal
+   needing more luxels than a few to subsample here pauses the light: the next round subsamples them
+   ahead and the light resumes there (pc.count != 0: the last round, the CPU does the lightmap) */
+void LightSupersample(){
+	const uint j = gl_WorkGroupID.x;
+	if ( gl_LocalInvocationID.x == 0 ) {
+		walkSubsamplesShared = 0;
+	}
+	barrier();
+	if ( ( pc.debugMode & DEBUG_NO_SUPERSAMPLE ) != 0 ) {
+		return;
+	}
+	const uint resume = pc.job.counters.c[ 8 + j ];
+	if ( resume == RESUME_DONE ) {
+		return;
+	}
+	const JobLight jl = pc.job.jobLights.j[ j ];
+	const Light light = pc.job.lights.l[ jl.a.x ];
+	const int sw = pc.job.sw, sh = pc.job.sh;
+	const int stampX0 = max( 0, jl.b.z - 1 ), stampY0 = max( 0, jl.b.w - 1 );
+	const int stampX1 = min( sw - 1, jl.c.x ), stampY1 = min( sh - 1, jl.c.y );
+	const int columns = stampX1 - stampX0, rows = stampY1 - stampY0;
+	if ( columns <= 0 || rows <= 0 ) {
+		return;
+	}
+	const int diagonals = columns + 2 * ( rows - 1 );
+	for ( int k = NextStampDiagonal( jl, int( resume ), diagonals ); k < diagonals; k = NextStampDiagonal( jl, k + 1, diagonals ) )
+	{
+		const int rowMin = max( 0, ( k - ( columns - 1 ) + 1 ) / 2 );
+		const int rowMax = min( rows - 1, k / 2 );
+
+		/* the luxels the diagonal's stamps subsample that weren't subsampled ahead */
+		if ( gl_LocalInvocationID.x == 0 ) {
+			unpredictedShared = 0;
+		}
+		barrier();
+		uint mine = 0;
+		for ( int row = rowMin + int( gl_LocalInvocationID.x ); row <= rowMax; row += int( gl_WorkGroupSize.x ) )
+		{
+			const int x = stampX0 + k - 2 * row, y = stampY0 + row;
+			if ( ( pc.job.flags.f[ TmpIndex( jl, x, y ) ] & ( FLAG_STAMP | FLAG_STAMP_CHANGED ) ) != 0 ) {
+				mine += StampUnpredicted( j, jl, x, y, false );
+			}
+		}
+		if ( mine != 0 ) {
+			atomicAdd( unpredictedShared, mine );
+		}
+		barrier();
+		const uint unpredicted = unpredictedShared;
+		if ( unpredicted != 0 && walkSubsamplesShared + unpredicted > uint( pc.job.inlineBudget ) ) {
+			for ( int row = rowMin + int( gl_LocalInvocationID.x ); row <= rowMax; row += int( gl_WorkGroupSize.x ) )
+			{
+				const int x = stampX0 + k - 2 * row, y = stampY0 + row;
+				if ( ( pc.job.flags.f[ TmpIndex( jl, x, y ) ] & ( FLAG_STAMP | FLAG_STAMP_CHANGED ) ) != 0 ) {
+					StampUnpredicted( j, jl, x, y, true );
+				}
+			}
+			if ( gl_LocalInvocationID.x == 0 ) {
+				pc.job.counters.c[ 8 + j ] = uint( k );
+				atomicAdd( pc.job.counters.c[ 6 ], 1u );
+				atomicAdd( pc.job.counters.c[ 7 ], 1u );
+				if ( pc.count != 0 ) {
+					atomicAdd( pc.job.counters.c[ 2 ], 1u );
+				}
+			}
+			return;
+		}
+		barrier();
+
+		for ( int row = rowMin + int( gl_LocalInvocationID.x ); row <= rowMax; row += int( gl_WorkGroupSize.x ) )
+		{
+			/* only the stamps marked ahead, or with a luxel a previous stamp changed, may subsample */
+			const int x = stampX0 + k - 2 * row, y = stampY0 + row;
+			if ( ( pc.job.flags.f[ TmpIndex( jl, x, y ) ] & ( FLAG_STAMP | FLAG_STAMP_CHANGED ) ) != 0 ) {
+				LightStamp( jl, light, x, y );
+			}
+		}
+		memoryBarrierBuffer();
+		barrier();
+	}
+	if ( gl_LocalInvocationID.x == 0 ) {
+		pc.job.counters.c[ 8 + j ] = RESUME_DONE;
+	}
+}
+
+/* adds the lights to the lightmap in light order (AccumulateRawLightmapLight()) */
+void LightAccumulate(){
+	const uint index = gl_GlobalInvocationID.x;
+	const int sw = pc.job.sw, sh = pc.job.sh;
+	if ( index >= uint( sw * sh ) || pc.job.counters.c[ 7 ] != 0 ) {
+		return; /* a light's walk paused: after the next round */
+	}
+	const int x = int( index ) % sw, y = int( index ) / sw;
+	if ( LuxelCluster( x, y ) < CLUSTER_NORMAL ) {
+		return;
+	}
+	vec4 luxel = pc.job.outs.o[ index ];
+	for ( int j = 0; j < pc.job.numJobLights; ++j )
+	{
+		const JobLight jl = pc.job.jobLights.j[ j ];
+		const int radius = jl.c.z;
+		/* the luxels the light changed (its area), and the filter around them */
+		if ( x < jl.a.z - radius || y < jl.a.w - radius || x >= jl.a.z + jl.b.x + radius || y >= jl.a.w + jl.b.y + radius ) {
+			continue;
+		}
+		const bool negative = jl.c.w != 0;
+		if ( radius != 0 ) {
+			precise vec3 averageColor = vec3( 0 );
+			precise float samples = 0;
+			for ( int sy = y - radius; sy <= y + radius; ++sy )
+			{
+				if ( sy < 0 || sy >= sh ) {
+					continue;
+				}
+				for ( int sx = x - radius; sx <= x + radius; ++sx )
+				{
+					if ( sx < 0 || sx >= sw ) {
+						continue;
+					}
+					if ( LuxelCluster( sx, sy ) < CLUSTER_NORMAL ) {
+						continue;
+					}
+					precise float weight = ( abs( sx - x ) == radius ? 0.5 : 1.0 );
+					weight *= ( abs( sy - y ) == radius ? 0.5 : 1.0 );
+					const vec3 value = InArea( jl, sx, sy ) ? TmpValue( TmpIndex( jl, sx, sy ), sx, sy ).xyz : vec3( 0 );
+					averageColor += value * weight;
+					samples += weight;
+				}
+			}
+			if ( samples <= 0 ) {
+				continue;
+			}
+			luxel.w = 1;
+			const vec3 average = vec3( FDiv( averageColor.x, samples ), FDiv( averageColor.y, samples ), FDiv( averageColor.z, samples ) );
+			precise vec3 sum = negative ? luxel.xyz - average : luxel.xyz + average;
+			luxel.xyz = sum;
+		}
+		else
+		{
+			const vec3 value = InArea( jl, x, y ) ? TmpValue( TmpIndex( jl, x, y ), x, y ).xyz : vec3( 0 );
+			luxel.w = 1;
+			precise vec3 sum = negative ? luxel.xyz - value : luxel.xyz + value;
+			luxel.xyz = sum;
+		}
+	}
+	pc.job.outs.o[ index ] = luxel;
+}
+
+void main(){
+	if ( pc.kernel == KERNEL_LIGHT_INITIAL ) {
+		LightInitial();
+	}
+	else if ( pc.kernel == KERNEL_LIGHT_MARK ) {
+		LightMark();
+	}
+	else if ( pc.kernel == KERNEL_LIGHT_SUBSAMPLE ) {
+		LightSubsample();
+	}
+	else if ( pc.kernel == KERNEL_LIGHT_WALK ) {
+		LightSupersample();
+	}
+	else if ( pc.kernel == KERNEL_LIGHT_ARGS ) {
+		LightArgs();
+	}
+	else if ( pc.kernel == KERNEL_LIGHT_ACCUMULATE ) {
+		LightAccumulate();
+	}
+	else if ( pc.kernel == KERNEL_GATHER_RAYS ) {
+		GatherRays();
+	}
+	else if ( pc.kernel == KERNEL_GATHER_REDUCE ) {
+		GatherReduce();
+	}
+	else{
+		TraceRays();
+	}
+}

@@ -31,6 +31,7 @@
 /* dependencies */
 #include "q3map2.h"
 #include "bspfile_rbsp.h"
+#include "light_gpu.h"
 #include <set>
 
 
@@ -774,7 +775,20 @@ float PointToPolygonFormFactor( const Vector3& point, const Vector3& normal, con
    determines the amount of light reaching a sample (luxel or vertex) from a given light
  */
 
+static int LightContributionToSampleInner( trace_t *trace );
+
 int LightContributionToSample( trace_t *trace ){
+	static const bool counted = DebugCounterEnabled( "sample" );
+	if ( counted ) {
+		const unsigned long long start = DebugCounterStart();
+		const int result = LightContributionToSampleInner( trace );
+		DebugCounterStop( start );
+		return result;
+	}
+	return LightContributionToSampleInner( trace );
+}
+
+static int LightContributionToSampleInner( trace_t *trace ){
 	float angle;
 	float add;
 	float dist;
@@ -1483,14 +1497,21 @@ static void TraceGrid( int num ){
 	trace.cluster = ClusterForPointExt( trace.origin, GRID_EPSILON );
 	if ( trace.cluster < CLUSTER_NORMAL ) {
 		/* try to nudge the origin around to find a valid point */
+		/* random sequence is seeded per grid point: rand() state is per thread,
+		   so using it here made the result depend on which thread got which point */
+		uint32_t seed = uint32_t( num ) * 2654435761u + 1;
+		const auto random = [&seed](){
+			seed = seed * 1664525u + 1013904223u;
+			return ( seed >> 8 ) * ( 1.0 / 16777216.0 );
+		};
 		const Vector3 baseOrigin( trace.origin );
 		double step = 0;
 		while ( ( step += 0.005 ) <= 1 )
 		{
 			trace.origin = baseOrigin;
-			trace.origin[ 0 ] += step * ( Random() - 0.5 ) * gridSize[0];
-			trace.origin[ 1 ] += step * ( Random() - 0.5 ) * gridSize[1];
-			trace.origin[ 2 ] += step * ( Random() - 0.5 ) * gridSize[2];
+			trace.origin[ 0 ] += step * ( random() - 0.5 ) * gridSize[0];
+			trace.origin[ 1 ] += step * ( random() - 0.5 ) * gridSize[1];
+			trace.origin[ 2 ] += step * ( random() - 0.5 ) * gridSize[2];
 
 			/* ydnar: changed to find cluster num */
 			trace.cluster = ClusterForPointExt( trace.origin, VERTEX_EPSILON );
@@ -1918,6 +1939,53 @@ static void WriteBSPFileAfterLight( const char *bspFileName ){
 
 
 /*
+   DebugPhaseHash()
+   debugging aid for finding nondeterminism: when env Q3MAP2_DEBUG_PHASEHASH names a file,
+   writes a hash of every raw lightmap's buffers after the given phase.
+   two runs can then be diffed to find the first phase whose results differ.
+ */
+
+static void DebugPhaseHash( const char *phase ){
+	static FILE *file = []() -> FILE* {
+		const char *path = getenv( "Q3MAP2_DEBUG_PHASEHASH" );
+		return path != nullptr ? fopen( path, "wt" ) : nullptr;
+	}();
+	if ( file == nullptr ) {
+		return;
+	}
+	const auto fnv = []( uint64_t h, const void *data, size_t size ){
+		for ( const byte *p = (const byte*)data, *end = p + size; p != end; ++p )
+			h = ( h ^ *p ) * 1099511628211ull;
+		return h;
+	};
+	constexpr uint64_t seed = 1469598103934665603ull;
+	fprintf( file, "%s drawverts %016llx\n", phase, (unsigned long long)fnv( seed, yDrawVerts.data(), yDrawVerts.size() * sizeof( yDrawVerts[ 0 ] ) ) );
+	uint64_t total = seed;
+	for ( int i = 0; i < numRawLightmaps; ++i )
+	{
+		const rawLightmap_t& lm = rawLightmaps[ i ];
+		const size_t n = size_t( lm.sw ) * lm.sh;
+		const auto part = [&]( const void *data, size_t size ){ return data != nullptr ? fnv( seed, data, size ) : 0; };
+		const uint64_t parts[] = {
+			part( lm.superLuxels[ 0 ], n * sizeof( SuperLuxel ) ),
+			part( lm.superOrigins, n * sizeof( Vector3 ) ),
+			part( lm.superNormals, n * sizeof( Vector3 ) ),
+			part( lm.superClusters, n * sizeof( int ) ),
+			part( lm.superFloodLight, n * sizeof( SuperFloodLight ) ),
+			part( lm.bspLuxels[ 0 ], size_t( lm.w ) * lm.h * sizeof( Vector3 ) ),
+		};
+		fprintf( file, "%s %d luxels %016llx origins %016llx normals %016llx clusters %016llx flood %016llx bsp %016llx\n", phase, i,
+		         (unsigned long long)parts[ 0 ], (unsigned long long)parts[ 1 ], (unsigned long long)parts[ 2 ],
+		         (unsigned long long)parts[ 3 ], (unsigned long long)parts[ 4 ], (unsigned long long)parts[ 5 ] );
+		total = fnv( total, parts, sizeof( parts ) );
+	}
+	fprintf( file, "%s total %016llx\n", phase, (unsigned long long)total );
+	fflush( file );
+}
+
+
+
+/*
    LightWorld()
    does what it says...
  */
@@ -2003,8 +2071,10 @@ static void LightWorld( bool fastAllocate, bool bounceStore ){
 	subdivideThreshold *= subdivideThreshold;
 
 	/* map the world luxels */
+	DebugPhaseHash( "BeforeMapRawLightmap" );
 	Sys_Printf( "--- MapRawLightmap ---\n" );
 	RunThreadsOnIndividual( numRawLightmaps, true, MapRawLightmap );
+	DebugPhaseHash( "MapRawLightmap" );
 	Sys_Printf( "%9d luxels\n", numLuxels );
 	Sys_Printf( "%9d luxels mapped\n", numLuxelsMapped );
 	Sys_Printf( "%9d luxels occluded\n", numLuxelsOccluded );
@@ -2013,10 +2083,12 @@ static void LightWorld( bool fastAllocate, bool bounceStore ){
 	if ( dirty ) {
 		Sys_Printf( "--- DirtyRawLightmap ---\n" );
 		RunThreadsOnIndividual( numRawLightmaps, true, DirtyRawLightmap );
+		DebugPhaseHash( "DirtyRawLightmap" );
 	}
 
 	/* floodlight pass */
 	FloodlightRawLightmaps();
+	DebugPhaseHash( "FloodlightRawLightmaps" );
 
 	/* ydnar: set up light envelopes */
 	SetupEnvelopes( false, fast );
@@ -2028,14 +2100,18 @@ static void LightWorld( bool fastAllocate, bool bounceStore ){
 	lightsClusterCulled = 0;
 
 	Sys_Printf( "--- IlluminateRawLightmap ---\n" );
+	GpuPrepareLights();
 	RunThreadsOnIndividual( numRawLightmaps, true, IlluminateRawLightmap );
 	Sys_Printf( "%9d luxels illuminated\n", numLuxelsIlluminated );
+	DebugPhaseHash( "IlluminateRawLightmap" );
 
 	StitchSurfaceLightmaps();
+	DebugPhaseHash( "StitchSurfaceLightmaps" );
 
 	Sys_Printf( "--- IlluminateVertexes ---\n" );
 	RunThreadsOnIndividual( bspDrawSurfaces.size(), true, IlluminateVertexes );
 	Sys_Printf( "%9d vertexes illuminated\n", numVertsIlluminated );
+	DebugPhaseHash( "IlluminateVertexes" );
 
 	/* ydnar: emit statistics on light culling */
 	Sys_FPrintf( SYS_VRB, "%9d lights plane culled\n", lightsPlaneCulled );
@@ -2102,6 +2178,7 @@ static void LightWorld( bool fastAllocate, bool bounceStore ){
 		lightsClusterCulled = 0;
 
 		Sys_Printf( "--- IlluminateRawLightmap ---\n" );
+		GpuPrepareLights();
 		RunThreadsOnIndividual( numRawLightmaps, true, IlluminateRawLightmap );
 		Sys_Printf( "%9d luxels illuminated\n", numLuxelsIlluminated );
 		Sys_Printf( "%9d vertexes illuminated\n", numVertsIlluminated );
@@ -2598,6 +2675,34 @@ int LightMain( Args& args ){
 			bounceStore = false;
 			Sys_Printf( "Storing BSP, lightmap and shader files only once after last bounce\n" );
 		}
+		while ( args.takeArg( "-splitwork" ) ) {
+			threadsHelpWithJobs = true;
+			Sys_Printf( "Splitting large lightmaps' work across threads\n" );
+		}
+		while ( args.takeArg( "-lightcull" ) ) {
+			lightCull = true;
+			Sys_Printf( "Lighting only the lightmap tiles each light can reach\n" );
+		}
+		while ( args.takeArg( "-embree" ) ) {
+#ifdef Q3MAP2_EMBREE
+			lightEmbree = true;
+			Sys_Printf( "Tracing rays with Intel Embree\n" );
+#else
+			Sys_Warning( "-embree: this q3map2 was built without Embree support, using the default ray tracer\n" );
+#endif
+		}
+		while ( args.takeArg( "-gpu" ) ) {
+#ifdef Q3MAP2_VULKAN
+			lightGpu = true;
+			Sys_Printf( "Tracing rays on the GPU where possible\n" );
+#ifdef Q3MAP2_EMBREE
+			/* the GPU repeats the -embree tracer: the rays left to the CPU use it too */
+			lightEmbree = true;
+#endif
+#else
+			Sys_Warning( "-gpu: this q3map2 was built without Vulkan support, using the CPU ray tracer\n" );
+#endif
+		}
 
 		while ( args.takeArg( "-nocollapse" ) ) {
 			noCollapse = true;
@@ -2968,6 +3073,7 @@ int LightMain( Args& args ){
 
 	/* light the world */
 	LightWorld( fastAllocate, bounceStore );
+	GpuShutdownTrace();
 
 	/* ydnar: export lightmaps */
 	if ( exportLightmaps && !externalLightmaps ) {

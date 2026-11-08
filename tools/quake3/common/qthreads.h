@@ -21,9 +21,30 @@
 
 #pragma once
 
+#include <functional>
+
 extern int numthreads;
 
 void ThreadSetDefault();
 void RunThreadsOnIndividual( int workcnt, bool showpacifier, void ( *func )( int ) );
 void ThreadLock();
 void ThreadUnlock();
+
+/* when enabled, worker threads that run out of RunThreadsOnIndividual items stay alive
+   and help with ParallelFor jobs started by the remaining busy items, instead of exiting */
+extern bool threadsHelpWithJobs;
+
+/* runs fn( 0 .. count-1 ), sharing the indexes with idle worker threads when threadsHelpWithJobs
+   is enabled and this is called from inside RunThreadsOnIndividual; otherwise runs them in order
+   on the calling thread. returns when all indexes are done. */
+void ParallelFor( int count, const std::function<void( int )>& fn );
+
+/* runs the process below normal priority; returns false if that failed */
+bool ThreadSetLowPriority();
+
+/* thread profiling (env Q3MAP2_DEBUG_THREADPROFILE): code can time one kind of work per thread;
+   each worker thread calls threadProfileFlush when it finishes, which should add its totals with
+   ThreadProfileAddCounter, and RunThreadsOnIndividual reports them next to its busy time */
+bool ThreadProfileEnabled();
+extern void ( *threadProfileFlush )();
+void ThreadProfileAddCounter( double seconds, long long calls );

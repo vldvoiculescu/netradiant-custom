@@ -834,11 +834,16 @@ struct CompareSurfaceInfo
 		}
 
 		/* 27: then shader! */
-		if ( aInfo.si < bInfo.si ) {
-			return false;
-		}
-		else if ( aInfo.si > bInfo.si ) {
-			return true;
+		/* compare by name, not by pointer: shaderInfo_t are separately allocated nodes,
+		   so pointer order depends on heap layout and differs between runs */
+		if ( aInfo.si != bInfo.si ) {
+			const int diff = strcmp( aInfo.si->shader, bInfo.si->shader );
+			if ( diff < 0 ) {
+				return false;
+			}
+			else if ( diff > 0 ) {
+				return true;
+			}
 		}
 
 
