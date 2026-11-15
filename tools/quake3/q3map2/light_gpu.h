@@ -205,6 +205,7 @@ void GpuEndLightmap();
 
 /* light_gpu.cpp */
 bool GpuSetup( const GpuScene& scene );     /* false: no usable GPU */
+bool GpuFailed();                           /* the GPU stopped working during the compile: the CPU does the rest */
 void GpuTrace( const GpuRay *rays, GpuHit *hits, size_t count, const int *surfaces, size_t numSurfaces ); /* thread safe */
 void GpuShutdown();
 

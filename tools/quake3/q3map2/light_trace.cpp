@@ -2482,7 +2482,7 @@ void SetupGpu(){
 }
 
 bool GpuTraceEnabled(){
-	return gpuReady;
+	return gpuReady && !GpuFailed();
 }
 
 /* shaders get their sky index when the sky lights are made, after SetupGpu() */

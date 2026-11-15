@@ -3030,7 +3030,7 @@ void GpuPrepareLights(){
  */
 
 static bool GpuIlluminateRawLightmap( rawLightmap_t *lm, const trace_t& trace, bool hybrid = false ){
-	if ( !gpuLighting || deluxemap || lightRandomSamples || lightSamples > 4 ) {
+	if ( !gpuLighting || deluxemap || lightRandomSamples || lightSamples > 4 || GpuFailed() ) {
 		return false;
 	}
 
@@ -3434,8 +3434,21 @@ void IlluminateRawLightmap( int rawLightmapNum ){
 				std::copy( keep.begin(), keep.end(), lm->superLuxels[ 0 ] );
 			}
 		}
-		else if ( !GpuIlluminateRawLightmap( lm, trace, true ) ) {
-			IlluminateRawLightmapLights( rawLightmapNum, lm, tmplm, trace, llSize, ldSize );
+		else{
+			/* debugging aid: env Q3MAP2_DEBUG_GPU_JOBLOG=1 logs each raw lightmap before and after it is lit, to find
+			   the one a GPU failure happened in (with Q3MAP2_DEBUG_GPU_INFLIGHT=1, one GPU lightmap at a time) */
+			static const bool jobLog = getenv( "Q3MAP2_DEBUG_GPU_JOBLOG" ) != nullptr;
+			if ( jobLog ) {
+				fprintf( stderr, "begin lm %d %dx%d lights %d\n", rawLightmapNum, lm->sw, lm->sh, trace.numLights );
+				fflush( stderr );
+			}
+			if ( !GpuIlluminateRawLightmap( lm, trace, true ) ) {
+				IlluminateRawLightmapLights( rawLightmapNum, lm, tmplm, trace, llSize, ldSize );
+			}
+			if ( jobLog ) {
+				fprintf( stderr, "end lm %d\n", rawLightmapNum );
+				fflush( stderr );
+			}
 		}
 
 		/* free temporary luxels */

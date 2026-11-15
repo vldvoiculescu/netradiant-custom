@@ -120,6 +120,8 @@ layout( buffer_reference, std430, buffer_reference_align = 16 ) readonly buffer 
 	float linearScale;
 	int inlineBudget;                           /* luxels a light's walk may subsample itself per round */
 	TmpFlags diagonals;                         /* per job light from its d.z: a bit per stamp diagonal with stamps to visit */
+	int walkBudget;                             /* stamp diagonals a light's walk may visit per round, so no dispatch runs long */
+	int pad;
 };
 
 layout( push_constant ) uniform Constants
@@ -1487,13 +1489,20 @@ vec4 TmpValue( uint i, int x, int y ){
 	return vec4( 0, 0, 0, LuxelCluster( x, y ) >= CLUSTER_NORMAL ? 1 : 0 );
 }
 
-/* the work item of a workgroup: a job light and one of its region's tiles */
+/* the work item of a workgroup: a job light and one of its region's tiles. more items than a dispatch's
+   row of workgroups take several rows, the last one partly: the workgroups past the last item have none */
+uint WorkItemIndex(){
+	return gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+}
 ivec4 WorkItem(){
-	return pc.job.items.t[ gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x ];
+	return pc.job.items.t[ WorkItemIndex() ];
 }
 
 /* the initial pass: one sample per luxel, a workgroup per tile of a light's region */
 void LightInitial(){
+	if ( WorkItemIndex() >= uint( pc.job.numItems ) ) {
+		return;
+	}
 	const ivec4 item = WorkItem();
 	const JobLight jl = pc.job.jobLights.j[ item.x ];
 	const Light light = pc.job.lights.l[ jl.a.x ];
@@ -1703,6 +1712,9 @@ void MarkStamp( uint j, JobLight jl, int x, int y ){
 
 /* the stamps from a luxel before a tile of the light's region to its last luxel, a workgroup per tile */
 void LightMark(){
+	if ( WorkItemIndex() >= uint( pc.job.numItems ) ) {
+		return;
+	}
 	const ivec4 item = WorkItem();
 	const JobLight jl = pc.job.jobLights.j[ item.x ];
 	int stampX0, stampY0, stampX1, stampY1;
@@ -1960,8 +1972,21 @@ void LightSupersample(){
 		return;
 	}
 	const int diagonals = columns + 2 * ( rows - 1 );
+	int walked = 0;
 	for ( int k = NextStampDiagonal( jl, int( resume ), diagonals ); k < diagonals; k = NextStampDiagonal( jl, k + 1, diagonals ) )
 	{
+		/* the light visited its diagonals for this round: it pauses before this one and the next round
+		   resumes there (the order of the stamps stays the same), so no dispatch runs long enough for the
+		   driver to reset the GPU; the last round walks on */
+		if ( pc.count == 0 && walked >= pc.job.walkBudget ) {
+			if ( gl_LocalInvocationID.x == 0 ) {
+				pc.job.counters.c[ 8 + j ] = uint( k );
+				atomicAdd( pc.job.counters.c[ 6 ], 1u );
+				atomicAdd( pc.job.counters.c[ 7 ], 1u );
+			}
+			return;
+		}
+		++walked;
 		const int rowMin = max( 0, ( k - ( columns - 1 ) + 1 ) / 2 );
 		const int rowMax = min( rows - 1, k / 2 );
 

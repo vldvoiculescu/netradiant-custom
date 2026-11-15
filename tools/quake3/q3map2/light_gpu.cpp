@@ -177,8 +177,9 @@ struct LightJob
 	float linearScale;
 	int32_t inlineBudget;
 	VkDeviceAddress diagonals;
+	int32_t walkBudget, pad;
 };
-static_assert( sizeof( LightJob ) == 184 );
+static_assert( sizeof( LightJob ) == 192 );
 static_assert( sizeof( GpuLight ) == 96 );
 static_assert( sizeof( GpuLuxel ) == 32 );
 static_assert( sizeof( GpuJobLight ) == 64 );
@@ -264,6 +265,40 @@ void Check( VkResult result, const char *what ){
 		Error( "-gpu: %s failed (Vulkan error %d)", what, int( result ) );
 	}
 }
+
+/* the GPU stopped working during the compile (the driver reset it, it ran out of memory, it hung):
+   the GPU isn't used any more and the CPU does the rest, from the work the GPU didn't finish */
+std::atomic<bool> gpuFailed{ false };
+
+void GpuFail( const char *what, VkResult result ){
+	if ( !gpuFailed.exchange( true ) ) {
+		if ( result == VK_TIMEOUT ) {
+			Sys_Warning( "-gpu: %s: the GPU did not finish its work in time, the CPU lights the rest of the map\n", what );
+		}
+		else{
+			Sys_Warning( "-gpu: %s failed (Vulkan error %d), the CPU lights the rest of the map\n", what, int( result ) );
+		}
+	}
+}
+
+/* during the compile: false, the GPU failed (now or before) */
+bool Soft( VkResult result, const char *what ){
+	if ( result != VK_SUCCESS ) {
+		GpuFail( what, result );
+		return false;
+	}
+	return !gpuFailed.load();
+}
+
+/* the longest wait for a batch (env Q3MAP2_DEBUG_GPU_TIMEOUT, seconds): a batch takes well under a second,
+   and on Windows the driver resets a GPU busy for 2 s; elsewhere a hung GPU would otherwise wait forever */
+uint64_t BatchTimeout(){
+	static const double seconds = getenv( "Q3MAP2_DEBUG_GPU_TIMEOUT" ) != nullptr ? atof( getenv( "Q3MAP2_DEBUG_GPU_TIMEOUT" ) ) : 60;
+	return uint64_t( std::max( seconds, 0.001 ) * 1e9 );
+}
+
+/* the device's dispatch limits: workgroups in x, y */
+uint32_t maxGroupsX = 65535, maxGroupsY = 65535;
 
 bool LoadVulkan(){
 #ifdef _WIN32
@@ -399,39 +434,6 @@ uint32_t FindMemoryType( uint32_t typeBits, VkMemoryPropertyFlags required, VkMe
 	Error( "-gpu: no suitable memory type" );
 }
 
-Buffer CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred = 0 ){
-	Buffer b;
-	b.size = std::max<VkDeviceSize>( size, 16 );
-
-	VkBufferCreateInfo info = VkStruct<VkBufferCreateInfo>( VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO );
-	info.size = b.size;
-	info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	Check( vkCreateBuffer( device, &info, nullptr, &b.buffer ), "vkCreateBuffer" );
-
-	VkMemoryRequirements requirements;
-	vkGetBufferMemoryRequirements( device, b.buffer, &requirements );
-	VkMemoryAllocateFlagsInfo flags = VkStruct<VkMemoryAllocateFlagsInfo>( VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO );
-	flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
-	VkMemoryAllocateInfo allocate = VkStruct<VkMemoryAllocateInfo>( VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO );
-	allocate.pNext = &flags;
-	allocate.allocationSize = requirements.size;
-	allocate.memoryTypeIndex = FindMemoryType( requirements.memoryTypeBits, required, preferred );
-	Check( vkAllocateMemory( device, &allocate, nullptr, &b.memory ), "vkAllocateMemory" );
-	Check( vkBindBufferMemory( device, b.buffer, b.memory, 0 ), "vkBindBufferMemory" );
-
-	const VkMemoryPropertyFlags memoryFlags = memoryProperties.memoryTypes[ allocate.memoryTypeIndex ].propertyFlags;
-	if ( memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ) {
-		Check( vkMapMemory( device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped ), "vkMapMemory" );
-		b.coherent = memoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	}
-
-	VkBufferDeviceAddressInfo address = VkStruct<VkBufferDeviceAddressInfo>( VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO );
-	address.buffer = b.buffer;
-	b.address = vkGetBufferDeviceAddress( device, &address );
-	return b;
-}
-
 void DestroyBuffer( Buffer& b ){
 	if ( b.buffer != VK_NULL_HANDLE ) {
 		vkDestroyBuffer( device, b.buffer, nullptr );
@@ -442,23 +444,82 @@ void DestroyBuffer( Buffer& b ){
 	b = Buffer();
 }
 
+/* soft: during the compile, a failure (out of GPU memory) fails the GPU and returns false instead of stopping */
+bool MakeBuffer( Buffer& b, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred, bool soft ){
+	const auto ok = [soft]( VkResult result, const char *what ){
+		if ( soft ) {
+			return Soft( result, what );
+		}
+		Check( result, what );
+		return true;
+	};
+	b = Buffer();
+	b.size = std::max<VkDeviceSize>( size, 16 );
+
+	VkBufferCreateInfo info = VkStruct<VkBufferCreateInfo>( VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO );
+	info.size = b.size;
+	info.usage = usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+	info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	if ( !ok( vkCreateBuffer( device, &info, nullptr, &b.buffer ), "vkCreateBuffer" ) ) {
+		DestroyBuffer( b );
+		return false;
+	}
+
+	VkMemoryRequirements requirements;
+	vkGetBufferMemoryRequirements( device, b.buffer, &requirements );
+	VkMemoryAllocateFlagsInfo flags = VkStruct<VkMemoryAllocateFlagsInfo>( VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO );
+	flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+	VkMemoryAllocateInfo allocate = VkStruct<VkMemoryAllocateInfo>( VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO );
+	allocate.pNext = &flags;
+	allocate.allocationSize = requirements.size;
+	allocate.memoryTypeIndex = FindMemoryType( requirements.memoryTypeBits, required, preferred );
+	if ( !ok( vkAllocateMemory( device, &allocate, nullptr, &b.memory ), "vkAllocateMemory" )
+	  || !ok( vkBindBufferMemory( device, b.buffer, b.memory, 0 ), "vkBindBufferMemory" ) ) {
+		DestroyBuffer( b );
+		return false;
+	}
+
+	const VkMemoryPropertyFlags memoryFlags = memoryProperties.memoryTypes[ allocate.memoryTypeIndex ].propertyFlags;
+	if ( memoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT ) {
+		if ( !ok( vkMapMemory( device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped ), "vkMapMemory" ) ) {
+			DestroyBuffer( b );
+			return false;
+		}
+		b.coherent = memoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	}
+
+	VkBufferDeviceAddressInfo address = VkStruct<VkBufferDeviceAddressInfo>( VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO );
+	address.buffer = b.buffer;
+	b.address = vkGetBufferDeviceAddress( device, &address );
+	return true;
+}
+
+Buffer CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags required, VkMemoryPropertyFlags preferred = 0 ){
+	Buffer b;
+	MakeBuffer( b, size, usage, required, preferred, false );
+	return b;
+}
+
 /* host buffers for batches: written or read by the CPU */
 const VkMemoryPropertyFlags hostMemory = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-void EnsureDeviceBuffer( Buffer& b, VkDeviceSize size ){
+/* batch buffers, grown as needed: false, the GPU failed */
+bool EnsureDeviceBuffer( Buffer& b, VkDeviceSize size ){
 	if ( b.size < size ) {
 		const VkDeviceSize grown = std::max( size, b.size * 2 );
 		DestroyBuffer( b );
-		b = CreateBuffer( grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+		return MakeBuffer( b, grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, true );
 	}
+	return true;
 }
 
-void EnsureHostBuffer( Buffer& b, VkDeviceSize size, VkMemoryPropertyFlags preferred ){
+bool EnsureHostBuffer( Buffer& b, VkDeviceSize size, VkMemoryPropertyFlags preferred ){
 	if ( b.size < size ) {
 		const VkDeviceSize grown = std::max( size, b.size * 2 );
 		DestroyBuffer( b );
-		b = CreateBuffer( grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, preferred );
+		return MakeBuffer( b, grown, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, preferred, true );
 	}
+	return true;
 }
 
 /* records and runs commands, waiting for them to finish (setup only) */
@@ -590,6 +651,8 @@ bool CreateDevice(){
 	if ( properties.limits.timestampComputeAndGraphics ) {
 		timestampPeriod = properties.limits.timestampPeriod;
 	}
+	maxGroupsX = std::max( properties.limits.maxComputeWorkGroupCount[ 0 ], 1u );
+	maxGroupsY = std::max( properties.limits.maxComputeWorkGroupCount[ 1 ], 1u );
 
 	uint32_t numFamilies = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties( physicalDevice, &numFamilies, nullptr );
@@ -691,7 +754,15 @@ void CreatePipeline(){
 	vkUpdateDescriptorSets( device, 1, &write, 0, nullptr );
 }
 
+/* timestamps of a batch: 0 start, 1 end, 2 after the initial pass, 3 before and 4 after the accumulation,
+   5 after the subsampling ahead and 6 after the walk of the last supersampling round */
+const uint32_t numTimestamps = 7;
+
+/* nullptr: the GPU failed */
 Slot *AcquireSlot(){
+	if ( gpuFailed ) {
+		return nullptr;
+	}
 	{
 		std::lock_guard lock( slotsMutex );
 		if ( !freeSlots.empty() ) {
@@ -704,19 +775,27 @@ Slot *AcquireSlot(){
 	VkCommandPoolCreateInfo poolInfo = VkStruct<VkCommandPoolCreateInfo>( VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO );
 	poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
 	poolInfo.queueFamilyIndex = queueFamily;
-	Check( vkCreateCommandPool( device, &poolInfo, nullptr, &slot->pool ), "vkCreateCommandPool" );
+	if ( !Soft( vkCreateCommandPool( device, &poolInfo, nullptr, &slot->pool ), "vkCreateCommandPool" ) ) {
+		return nullptr; /* the GPU isn't used any more: its objects are left to the driver */
+	}
 	VkCommandBufferAllocateInfo allocate = VkStruct<VkCommandBufferAllocateInfo>( VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO );
 	allocate.commandPool = slot->pool;
 	allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
 	allocate.commandBufferCount = 1;
-	Check( vkAllocateCommandBuffers( device, &allocate, &slot->cmd ), "vkAllocateCommandBuffers" );
+	if ( !Soft( vkAllocateCommandBuffers( device, &allocate, &slot->cmd ), "vkAllocateCommandBuffers" ) ) {
+		return nullptr;
+	}
 	VkFenceCreateInfo fenceInfo = VkStruct<VkFenceCreateInfo>( VK_STRUCTURE_TYPE_FENCE_CREATE_INFO );
-	Check( vkCreateFence( device, &fenceInfo, nullptr, &slot->fence ), "vkCreateFence" );
+	if ( !Soft( vkCreateFence( device, &fenceInfo, nullptr, &slot->fence ), "vkCreateFence" ) ) {
+		return nullptr;
+	}
 	if ( timestampPeriod != 0 ) {
 		VkQueryPoolCreateInfo queryInfo = VkStruct<VkQueryPoolCreateInfo>( VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO );
 		queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-		queryInfo.queryCount = 5;
-		Check( vkCreateQueryPool( device, &queryInfo, nullptr, &slot->timestamps ), "vkCreateQueryPool" );
+		queryInfo.queryCount = numTimestamps;
+		if ( !Soft( vkCreateQueryPool( device, &queryInfo, nullptr, &slot->timestamps ), "vkCreateQueryPool" ) ) {
+			return nullptr;
+		}
 	}
 
 	std::lock_guard lock( slotsMutex );
@@ -838,15 +917,27 @@ namespace
 const size_t maxPerDispatch = size_t( 65535 ) * 64;
 const VkMemoryPropertyFlags cachedMemory = VK_MEMORY_PROPERTY_HOST_CACHED_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
 
-/* records a batch's commands, runs them and waits: the shader's writes are visible to the host after */
+/* records a batch's commands, runs them and waits: the shader's writes are visible to the host after;
+   false: the GPU failed, the batch's results aren't there */
 template<typename Record>
-void RunBatch( Slot *slot, Record&& record ){
-	Check( vkResetCommandPool( device, slot->pool, 0 ), "vkResetCommandPool" );
+bool RunBatch( Slot *slot, Record&& record ){
+	/* debugging aid: env Q3MAP2_DEBUG_GPU_FAIL=<n> fails the GPU at its nth batch, to test the CPU taking over */
+	static const long long failAt = getenv( "Q3MAP2_DEBUG_GPU_FAIL" ) != nullptr ? atoll( getenv( "Q3MAP2_DEBUG_GPU_FAIL" ) ) : 0;
+	static std::atomic<long long> batchCount;
+	if ( failAt > 0 && ++batchCount == failAt ) {
+		GpuFail( "a batch (test failure, env Q3MAP2_DEBUG_GPU_FAIL)", VK_ERROR_DEVICE_LOST );
+	}
+	if ( gpuFailed
+	  || !Soft( vkResetCommandPool( device, slot->pool, 0 ), "vkResetCommandPool" ) ) {
+		return false;
+	}
 	VkCommandBufferBeginInfo begin = VkStruct<VkCommandBufferBeginInfo>( VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO );
 	begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	Check( vkBeginCommandBuffer( slot->cmd, &begin ), "vkBeginCommandBuffer" );
+	if ( !Soft( vkBeginCommandBuffer( slot->cmd, &begin ), "vkBeginCommandBuffer" ) ) {
+		return false;
+	}
 	if ( slot->timestamps != VK_NULL_HANDLE ) {
-		vkCmdResetQueryPool( slot->cmd, slot->timestamps, 0, 5 );
+		vkCmdResetQueryPool( slot->cmd, slot->timestamps, 0, numTimestamps );
 		vkCmdWriteTimestamp( slot->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, slot->timestamps, 0 );
 	}
 	vkCmdBindPipeline( slot->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline );
@@ -859,28 +950,44 @@ void RunBatch( Slot *slot, Record&& record ){
 	barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
 	barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
 	vkCmdPipelineBarrier( slot->cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
-	Check( vkEndCommandBuffer( slot->cmd ), "vkEndCommandBuffer" );
+	/* (a failure while recording, like no memory for an upload, failed the GPU: Soft() is false) */
+	if ( !Soft( vkEndCommandBuffer( slot->cmd ), "vkEndCommandBuffer" ) ) {
+		return false;
+	}
 
 	VkSubmitInfo submit = VkStruct<VkSubmitInfo>( VK_STRUCTURE_TYPE_SUBMIT_INFO );
 	submit.commandBufferCount = 1;
 	submit.pCommandBuffers = &slot->cmd;
 	{
 		std::lock_guard lock( queueMutexes[ slot->queue ] );
-		Check( vkQueueSubmit( queues[ slot->queue ], 1, &submit, slot->fence ), "vkQueueSubmit" );
+		if ( !Soft( vkQueueSubmit( queues[ slot->queue ], 1, &submit, slot->fence ), "vkQueueSubmit" ) ) {
+			return false;
+		}
 	}
-	Check( vkWaitForFences( device, 1, &slot->fence, VK_TRUE, UINT64_MAX ), "vkWaitForFences" );
-	Check( vkResetFences( device, 1, &slot->fence ), "vkResetFences" );
+	/* a batch the GPU doesn't finish in time (it hung): the GPU may still be at it, so the slot and its
+	   buffers are never used or freed again */
+	if ( !Soft( vkWaitForFences( device, 1, &slot->fence, VK_TRUE, BatchTimeout() ), "vkWaitForFences" )
+	  || !Soft( vkResetFences( device, 1, &slot->fence ), "vkResetFences" ) ) {
+		return false;
+	}
 	if ( slot->timestamps != VK_NULL_HANDLE ) {
 		uint64_t ticks[ 2 ];
 		if ( vkGetQueryPoolResults( device, slot->timestamps, 0, 2, sizeof( ticks ), ticks, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT ) == VK_SUCCESS ) {
 			statShaderNanoseconds += (long long)( ( ticks[ 1 ] - ticks[ 0 ] ) * double( timestampPeriod ) );
 		}
 	}
+	return true;
 }
 
+/* a workgroup of 256 threads per 256 threads; the callers keep the workgroups within the device's limit */
 void Dispatch( VkCommandBuffer cmd, const Constants& constants, size_t threads ){
 	vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
 	vkCmdDispatch( cmd, uint32_t( ( threads + 255 ) / 256 ), 1, 1 );
+}
+
+/* the workgroups of a 256 thread dispatch fit in the device's limit */
+bool DispatchFits( size_t threads ){
+	return ( threads + 255 ) / 256 <= maxGroupsX;
 }
 
 /* a dispatch's writes are seen by the next one */
@@ -891,42 +998,67 @@ void ComputeBarrier( VkCommandBuffer cmd ){
 	vkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr );
 }
 
-/* the host reads what the GPU wrote */
-void ReadBuffer( const Buffer& b, void *destination, size_t size ){
+/* the host reads what the GPU wrote; false: the GPU failed */
+bool ReadBuffer( const Buffer& b, void *destination, size_t size ){
 	if ( !b.coherent ) {
 		VkMappedMemoryRange range = VkStruct<VkMappedMemoryRange>( VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE );
 		range.memory = b.memory;
 		range.size = VK_WHOLE_SIZE;
-		Check( vkInvalidateMappedMemoryRanges( device, 1, &range ), "vkInvalidateMappedMemoryRanges" );
+		if ( !Soft( vkInvalidateMappedMemoryRanges( device, 1, &range ), "vkInvalidateMappedMemoryRanges" ) ) {
+			return false;
+		}
 	}
 	const auto start = std::chrono::steady_clock::now();
 	memcpy( destination, b.mapped, size );
 	statCopyMicroseconds += std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now() - start ).count();
+	return true;
 }
 
-void WriteBuffer( Buffer& b, const void *source, size_t size, VkMemoryPropertyFlags preferred = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ){
-	EnsureHostBuffer( b, std::max<size_t>( size, 4 ), preferred );
+/* false: the GPU failed */
+bool WriteBuffer( Buffer& b, const void *source, size_t size, VkMemoryPropertyFlags preferred = VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ){
+	if ( !EnsureHostBuffer( b, std::max<size_t>( size, 4 ), preferred ) ) {
+		return false;
+	}
 	const auto start = std::chrono::steady_clock::now();
 	if ( size != 0 ) {
 		memcpy( b.mapped, source, size );
 	}
 	statCopyMicroseconds += std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now() - start ).count();
+	return true;
 }
+}
+
+bool GpuFailed(){
+	return gpuFailed;
 }
 
 void GpuTrace( const GpuRay *rays, GpuHit *hits, size_t count, const int *surfaces, size_t numSurfaces ){
 	if ( count == 0 ) {
 		return;
 	}
+	/* the GPU failed: the CPU traces the rays (GpuTraceBatch::apply()) */
+	const auto failed = [&](){
+		for ( size_t i = 0; i < count; ++i )
+		{
+			hits[ i ] = GpuHit{};
+			hits[ i ].status = GPU_HIT_OVERFLOW;
+		}
+	};
 	const auto start = std::chrono::steady_clock::now();
 	Slot *slot = AcquireSlot();
-	WriteBuffer( slot->surfaces, surfaces, numSurfaces * sizeof( int ) );
+	if ( slot == nullptr || !WriteBuffer( slot->surfaces, surfaces, numSurfaces * sizeof( int ) ) ) {
+		failed();
+		return;
+	}
 
 	for ( size_t first = 0; first < count; first += maxPerDispatch )
 	{
 		const size_t n = std::min( count - first, maxPerDispatch );
-		WriteBuffer( slot->rays, rays + first, n * sizeof( GpuRay ) );
-		EnsureHostBuffer( slot->hits, n * sizeof( GpuHit ), cachedMemory );
+		if ( !WriteBuffer( slot->rays, rays + first, n * sizeof( GpuRay ) )
+		  || !EnsureHostBuffer( slot->hits, n * sizeof( GpuHit ), cachedMemory ) ) {
+			failed();
+			return;
+		}
 
 		Constants constants = sceneConstants;
 		constants.rays = slot->rays.address;
@@ -934,10 +1066,13 @@ void GpuTrace( const GpuRay *rays, GpuHit *hits, size_t count, const int *surfac
 		constants.surfaces = slot->surfaces.address;
 		constants.count = uint32_t( n );
 		constants.kernel = KERNEL_TRACE;
-		RunBatch( slot, [&]( VkCommandBuffer cmd ){
+		if ( !RunBatch( slot, [&]( VkCommandBuffer cmd ){
 			Dispatch( cmd, constants, n );
-		} );
-		ReadBuffer( slot->hits, hits + first, n * sizeof( GpuHit ) );
+		} )
+		  || !ReadBuffer( slot->hits, hits + first, n * sizeof( GpuHit ) ) ) {
+			failed();
+			return;
+		}
 	}
 
 	ReleaseSlot( slot );
@@ -950,21 +1085,33 @@ void GpuGather( const GpuGatherParams& params, const GpuGatherSample *samples, s
 	if ( count == 0 || params.numVectors <= 0 ) {
 		return;
 	}
+	/* the GPU failed: the CPU computes the samples (GPU_GATHER_OVERFLOW) */
+	const auto failed = [&](){
+		for ( size_t i = 0; i < count; ++i )
+			outs[ i ] = GpuGatherOut{ 0, GPU_GATHER_OVERFLOW };
+	};
 	const auto start = std::chrono::steady_clock::now();
 	Slot *slot = AcquireSlot();
-	WriteBuffer( slot->surfaces, params.surfaces, params.numSurfaces * sizeof( int ) );
 	std::vector<float> vectors( params.numVectors * 4, 0.0f );
 	for ( int i = 0; i < params.numVectors; ++i )
 		std::copy_n( params.vectors + i * 3, 3, vectors.begin() + i * 4 );
-	WriteBuffer( slot->vectors, vectors.data(), vectors.size() * sizeof( float ) );
+	if ( slot == nullptr
+	  || !WriteBuffer( slot->surfaces, params.surfaces, params.numSurfaces * sizeof( int ) )
+	  || !WriteBuffer( slot->vectors, vectors.data(), vectors.size() * sizeof( float ) ) ) {
+		failed();
+		return;
+	}
 
 	const size_t maxSamples = std::max<size_t>( 1, maxPerDispatch / params.numVectors );
 	for ( size_t first = 0; first < count; first += maxSamples )
 	{
 		const size_t n = std::min( count - first, maxSamples );
-		WriteBuffer( slot->samples, samples + first, n * sizeof( GpuGatherSample ) );
-		EnsureDeviceBuffer( slot->values, n * params.numVectors * 16 );
-		EnsureHostBuffer( slot->outs, n * sizeof( GpuGatherOut ), cachedMemory );
+		if ( !WriteBuffer( slot->samples, samples + first, n * sizeof( GpuGatherSample ) )
+		  || !EnsureDeviceBuffer( slot->values, n * params.numVectors * 16 )
+		  || !EnsureHostBuffer( slot->outs, n * sizeof( GpuGatherOut ), cachedMemory ) ) {
+			failed();
+			return;
+		}
 
 		GatherParams gather;
 		gather.samples = slot->samples.address;
@@ -981,19 +1128,25 @@ void GpuGather( const GpuGatherParams& params, const GpuGatherSample *samples, s
 		gather.rayFlags = params.rayFlags;
 		gather.translucentFlag = params.translucentFlag;
 		gather.ooDepth = params.ooDepth;
-		WriteBuffer( slot->params, &gather, sizeof( gather ) );
+		if ( !WriteBuffer( slot->params, &gather, sizeof( gather ) ) ) {
+			failed();
+			return;
+		}
 
 		Constants constants = sceneConstants;
 		constants.surfaces = slot->surfaces.address;
 		constants.params = slot->params.address;
-		RunBatch( slot, [&]( VkCommandBuffer cmd ){
+		if ( !RunBatch( slot, [&]( VkCommandBuffer cmd ){
 			constants.kernel = KERNEL_GATHER_RAYS;
 			Dispatch( cmd, constants, n * params.numVectors );
 			ComputeBarrier( cmd );
 			constants.kernel = KERNEL_GATHER_REDUCE;
 			Dispatch( cmd, constants, n );
-		} );
-		ReadBuffer( slot->outs, outs + first, n * sizeof( GpuGatherOut ) );
+		} )
+		  || !ReadBuffer( slot->outs, outs + first, n * sizeof( GpuGatherOut ) ) ) {
+			failed();
+			return;
+		}
 	}
 
 	ReleaseSlot( slot );
@@ -1003,20 +1156,18 @@ void GpuGather( const GpuGatherParams& params, const GpuGatherSample *samples, s
 }
 
 void GpuSetInfos( const std::vector<GpuInfo>& newInfos ){
-	if ( device == VK_NULL_HANDLE ) {
+	if ( device == VK_NULL_HANDLE || gpuFailed || !Soft( vkDeviceWaitIdle( device ), "vkDeviceWaitIdle" ) ) {
 		return;
 	}
-	vkDeviceWaitIdle( device );
 	DestroyBuffer( infos );
 	infos = Upload( newInfos, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT );
 	sceneConstants.infos = infos.address;
 }
 
 void GpuSetLights( const std::vector<GpuLight>& lights, const std::vector<float>& windings, const GpuLightParams& params ){
-	if ( device == VK_NULL_HANDLE ) {
+	if ( device == VK_NULL_HANDLE || gpuFailed || !Soft( vkDeviceWaitIdle( device ), "vkDeviceWaitIdle" ) ) {
 		return;
 	}
-	vkDeviceWaitIdle( device );
 	DestroyBuffer( lightTable );
 	DestroyBuffer( lightWindings );
 	lightTable = Upload( lights, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT );
@@ -1045,11 +1196,14 @@ struct UploadItem
 	size_t size;
 };
 
+/* (no memory for the staging buffer fails the GPU, RunBatch() returns false) */
 void RecordUploads( Slot *slot, VkCommandBuffer cmd, std::initializer_list<UploadItem> items ){
 	size_t total = 0;
 	for ( const UploadItem& item : items )
 		total += Align16( item.size );
-	EnsureHostBuffer( slot->staging, std::max<size_t>( total, 16 ), VK_MEMORY_PROPERTY_HOST_COHERENT_BIT );
+	if ( !EnsureHostBuffer( slot->staging, std::max<size_t>( total, 16 ), VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ) ) {
+		return;
+	}
 	size_t offset = 0;
 	const auto start = std::chrono::steady_clock::now();
 	for ( const UploadItem& item : items )
@@ -1069,39 +1223,63 @@ void RecordUploads( Slot *slot, VkCommandBuffer cmd, std::initializer_list<Uploa
 /* luxels of per-light buffers in one batch */
 const size_t maxJobTmp = size_t( 1 ) << 21;
 /* supersampling rounds for the luxels the walk didn't predict (env Q3MAP2_DEBUG_GPU_ROUNDS) */
-const int subsampleRounds = getenv( "Q3MAP2_DEBUG_GPU_ROUNDS" ) != nullptr ? std::max( 1, atoi( getenv( "Q3MAP2_DEBUG_GPU_ROUNDS" ) ) ) : 64;
+const int subsampleRounds = getenv( "Q3MAP2_DEBUG_GPU_ROUNDS" ) != nullptr ? std::max( 1, atoi( getenv( "Q3MAP2_DEBUG_GPU_ROUNDS" ) ) ) : 256;
 std::atomic<long long> statPausedLights;
 /* luxels the walk of a light may subsample itself per round, one per stamp thread, before it pauses (env Q3MAP2_DEBUG_GPU_INLINE) */
 const int inlineBudget = getenv( "Q3MAP2_DEBUG_GPU_INLINE" ) != nullptr ? std::max( 0, atoi( getenv( "Q3MAP2_DEBUG_GPU_INLINE" ) ) ) : 4096;
+/* stamp diagonals a light's walk may visit per supersampling round (env Q3MAP2_DEBUG_GPU_WALK): the walk of a
+   light is one workgroup's sequential work, which the driver may stop as hung (Windows resets a GPU busy for 2 s)
+   on big lightmaps; the light pauses and the next round resumes it, in the same order */
+const int walkBudget = getenv( "Q3MAP2_DEBUG_GPU_WALK" ) != nullptr ? std::max( 1, atoi( getenv( "Q3MAP2_DEBUG_GPU_WALK" ) ) ) : 256;
+std::atomic<long long> statLimitLightmaps, statFailedLightmaps;
 }
 
 bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
-	if ( lightTable.buffer == VK_NULL_HANDLE ) {
+	if ( lightTable.buffer == VK_NULL_HANDLE || gpuFailed ) {
+		return false;
+	}
+	const size_t numLuxels = size_t( job.sw ) * job.sh;
+	/* the accumulation dispatch: a thread per luxel */
+	if ( !DispatchFits( numLuxels ) ) {
+		++statLimitLightmaps;
 		return false;
 	}
 	const auto start = std::chrono::steady_clock::now();
 	Slot *slot = AcquireSlot();
-	const size_t numLuxels = size_t( job.sw ) * job.sh;
-
-	EnsureDeviceBuffer( slot->jobLuxels, numLuxels * sizeof( GpuLuxel ) );
-	EnsureDeviceBuffer( slot->jobOuts, numLuxels * 16 );
-	EnsureDeviceBuffer( slot->jobClusters, std::max( job.numLightClusters, 1 ) * sizeof( int ) );
-	EnsureDeviceBuffer( slot->jobSurfaces, std::max( job.numSurfaces, 1 ) * sizeof( int ) );
-	EnsureDeviceBuffer( slot->jobParams, sizeof( LightJob ) );
-	EnsureDeviceBuffer( slot->jobCounters, 32 + size_t( job.numLights ) * 4 ); /* counters, then a resume diagonal per light */
-	if ( slot->jobArgs.buffer == VK_NULL_HANDLE ) {
-		slot->jobArgs = CreateBuffer( 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+	if ( slot == nullptr ) {
+		return false;
 	}
-	EnsureHostBuffer( slot->readback, numLuxels * 16 + 32, cachedMemory );
+	/* the GPU failed: the CPU does the lightmap (and the GPU isn't used any more, the slot neither) */
+	const auto failed = [&](){
+		++statFailedLightmaps;
+		return false;
+	};
+	static const bool jobLog = getenv( "Q3MAP2_DEBUG_GPU_JOBLOG" ) != nullptr;
+	if ( jobLog ) {
+		fprintf( stderr, "gpu job %dx%d lights %d\n", job.sw, job.sh, job.numLights );
+		fflush( stderr );
+	}
 
-	/* batches of lights, their per-light buffers within maxJobTmp luxels */
+	if ( !EnsureDeviceBuffer( slot->jobLuxels, numLuxels * sizeof( GpuLuxel ) )
+	  || !EnsureDeviceBuffer( slot->jobOuts, numLuxels * 16 )
+	  || !EnsureDeviceBuffer( slot->jobClusters, std::max( job.numLightClusters, 1 ) * sizeof( int ) )
+	  || !EnsureDeviceBuffer( slot->jobSurfaces, std::max( job.numSurfaces, 1 ) * sizeof( int ) )
+	  || !EnsureDeviceBuffer( slot->jobParams, sizeof( LightJob ) )
+	  || !EnsureDeviceBuffer( slot->jobCounters, 32 + size_t( job.numLights ) * 4 ) /* counters, then a resume diagonal per light */
+	  || ( slot->jobArgs.buffer == VK_NULL_HANDLE && !MakeBuffer( slot->jobArgs, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, true ) )
+	  || !EnsureHostBuffer( slot->readback, numLuxels * 16 + 32, cachedMemory ) ) {
+		return failed();
+	}
+
+	/* batches of lights, their per-light buffers within maxJobTmp luxels, and no more lights than
+	   workgroups of a dispatch (the walk: a workgroup per light) */
 	std::vector<GpuJobLight> lights( job.lights, job.lights + job.numLights );
 	bool first = true;
 	for ( size_t begin = 0; begin < lights.size(); )
 	{
 		size_t end = begin;
 		size_t totalTmp = 0;
-		while ( end < lights.size() && ( end == begin || totalTmp + size_t( lights[ end ].aw ) * lights[ end ].ah <= maxJobTmp ) )
+		while ( end < lights.size() && end - begin < maxGroupsX && ( end == begin || totalTmp + size_t( lights[ end ].aw ) * lights[ end ].ah <= maxJobTmp ) )
 		{
 			lights[ end ].tmpOffset = int( totalTmp );
 			totalTmp += size_t( lights[ end ].aw ) * lights[ end ].ah;
@@ -1128,14 +1306,24 @@ bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
 			}
 		}
 		const uint32_t numItems = uint32_t( items.size() / 4 );
-		EnsureDeviceBuffer( slot->jobItems, std::max<size_t>( items.size(), 4 ) * sizeof( int ) );
-		EnsureDeviceBuffer( slot->jobCandidates, std::max<size_t>( totalTmp, 1 ) * 8 );
-		EnsureDeviceBuffer( slot->jobDiagonals, diagonalWords * 4 );
-
-		EnsureDeviceBuffer( slot->jobLights, numJobLights * sizeof( GpuJobLight ) );
-		EnsureDeviceBuffer( slot->jobTmp, std::max<size_t>( totalTmp, 1 ) * 16 );
-		EnsureDeviceBuffer( slot->jobSub, std::max<size_t>( totalTmp, 1 ) * 16 );
-		EnsureDeviceBuffer( slot->jobFlags, std::max<size_t>( totalTmp, 1 ) * 4 );
+		/* a workgroup per item, in rows of the device's limit (the shader skips the workgroups past the last
+		   item, WorkItemIndex()); the subsampling ahead: a thread per candidate luxel, at most one per tmp luxel */
+		const uint32_t itemsX = std::min( numItems, maxGroupsX );
+		const uint32_t itemsY = itemsX == 0 ? 0 : uint32_t( ( size_t( numItems ) + itemsX - 1 ) / itemsX );
+		if ( itemsY > maxGroupsY || !DispatchFits( totalTmp ) ) {
+			ReleaseSlot( slot );
+			++statLimitLightmaps;
+			return false;
+		}
+		if ( !EnsureDeviceBuffer( slot->jobItems, std::max<size_t>( items.size(), 4 ) * sizeof( int ) )
+		  || !EnsureDeviceBuffer( slot->jobCandidates, std::max<size_t>( totalTmp, 1 ) * 8 )
+		  || !EnsureDeviceBuffer( slot->jobDiagonals, diagonalWords * 4 )
+		  || !EnsureDeviceBuffer( slot->jobLights, numJobLights * sizeof( GpuJobLight ) )
+		  || !EnsureDeviceBuffer( slot->jobTmp, std::max<size_t>( totalTmp, 1 ) * 16 )
+		  || !EnsureDeviceBuffer( slot->jobSub, std::max<size_t>( totalTmp, 1 ) * 16 )
+		  || !EnsureDeviceBuffer( slot->jobFlags, std::max<size_t>( totalTmp, 1 ) * 4 ) ) {
+			return failed();
+		}
 
 		LightJob params{};
 		params.luxels = slot->jobLuxels.address;
@@ -1170,6 +1358,7 @@ bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
 		params.rayFlags = int32_t( lightParams.rayFlags );
 		params.linearScale = lightParams.linearScale;
 		params.inlineBudget = inlineBudget;
+		params.walkBudget = walkBudget;
 
 		Constants constants = sceneConstants;
 		constants.surfaces = slot->jobSurfaces.address;
@@ -1193,11 +1382,13 @@ bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
 			vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
 			vkCmdDispatchIndirect( cmd, slot->jobArgs.buffer, 0 );
 			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
+			mark( cmd, 5 );
 			constants.kernel = KERNEL_LIGHT_WALK;
 			constants.count = lastRound ? 1 : 0;
 			vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
 			vkCmdDispatch( cmd, uint32_t( numJobLights ), 1, 1 );
 			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
+			mark( cmd, 6 );
 			constants.count = 0;
 		};
 		/* adds the lights to the luxels unless a walk paused, then the counters (and the luxels) for the host */
@@ -1217,17 +1408,33 @@ bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
 			Barrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT );
 		};
 		const bool supersample = lightParams.lightSamples > 1;
-		const auto timestamps = [&](){
+		const auto timestamps = [&]( int round ){
 			if ( slot->timestamps != VK_NULL_HANDLE ) {
-				uint64_t ticks[ 5 ];
+				uint64_t ticks[ numTimestamps ];
 				if ( vkGetQueryPoolResults( device, slot->timestamps, 0, 5, sizeof( ticks ), ticks, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT ) == VK_SUCCESS ) {
 					for ( int k = 0; k < 3; ++k )
 						statKernelNanoseconds[ k ] += (long long)( ( ticks[ 2 + k ] - ticks[ k == 0 ? 0 : 1 + k ] ) * double( timestampPeriod ) );
+					/* debugging aid: env Q3MAP2_DEBUG_GPU_BATCHLOG=<seconds> logs the light batches taking longer on the GPU */
+					static const double batchLog = getenv( "Q3MAP2_DEBUG_GPU_BATCHLOG" ) != nullptr ? atof( getenv( "Q3MAP2_DEBUG_GPU_BATCHLOG" ) ) : 0;
+					const auto seconds = [&]( int a, int b ){ return ( ticks[ b ] - ticks[ a ] ) * double( timestampPeriod ) * 1e-9; };
+					if ( batchLog > 0 && seconds( 0, 1 ) >= batchLog ) {
+						double ahead = 0, walk = 0;
+						if ( supersample && vkGetQueryPoolResults( device, slot->timestamps, 5, 2, 2 * sizeof( uint64_t ), ticks + 5, sizeof( uint64_t ), VK_QUERY_RESULT_64_BIT ) == VK_SUCCESS ) {
+							ahead = seconds( 2, 5 );
+							walk = seconds( 5, 6 );
+						}
+						fprintf( stderr, "gpu batch: %.3f s (initial %.3f, supersample %.3f: mark and subsample ahead %.3f, walk %.3f; accumulate %.3f) round %d, lightmap %dx%d, %d lights, %zu tmp luxels, %u items\n",
+						         seconds( 0, 1 ), seconds( 0, 2 ), seconds( 2, 3 ), ahead, walk, seconds( 3, 4 ), round, job.sw, job.sh, numJobLights, totalTmp, numItems );
+					}
 				}
 			}
 		};
+		if ( jobLog ) {
+			fprintf( stderr, "  chunk lights %zu..%zu of %zu, tmp %zu, items %u, diagonal words %zu, first %d\n", begin, end, lights.size(), totalTmp, numItems, diagonalWords, int( first ) );
+			fflush( stderr );
+		}
 
-		RunBatch( slot, [&]( VkCommandBuffer cmd ){
+		const bool ran = RunBatch( slot, [&]( VkCommandBuffer cmd ){
 			/* luxels without light, the candidates and the rounds' state */
 			vkCmdFillBuffer( cmd, slot->jobFlags.buffer, 0, std::max<size_t>( totalTmp, 1 ) * 4, 0 );
 			vkCmdFillBuffer( cmd, slot->jobDiagonals.buffer, 0, diagonalWords * 4, 0 );
@@ -1261,8 +1468,7 @@ bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
 			const auto dispatchItems = [&]( uint32_t kernel ){
 				constants.kernel = kernel;
 				vkCmdPushConstants( cmd, pipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof( constants ), &constants );
-				const uint32_t x = std::min<uint32_t>( numItems, 65535 );
-				vkCmdDispatch( cmd, x, x == 0 ? 0 : ( numItems + x - 1 ) / x, 1 );
+				vkCmdDispatch( cmd, itemsX, itemsY, 1 );
 			};
 			dispatchItems( KERNEL_LIGHT_INITIAL );
 			Barrier( cmd, compute, VK_ACCESS_SHADER_WRITE_BIT, compute, readWrite );
@@ -1275,22 +1481,33 @@ bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
 			}
 			recordFinish( cmd );
 		} );
-		timestamps();
-
 		/* paused lights: more rounds, only for the lightmaps needing them */
 		uint32_t counters[ 8 ];
-		ReadBuffer( slot->readback, counters, sizeof( counters ) );
+		if ( !ran || !ReadBuffer( slot->readback, counters, sizeof( counters ) ) ) {
+			return failed();
+		}
+		timestamps( 0 );
+		if ( jobLog ) {
+			fprintf( stderr, "  chunk done: counters %u %u %u %u %u %u %u %u\n", counters[ 0 ], counters[ 1 ], counters[ 2 ], counters[ 3 ], counters[ 4 ], counters[ 5 ], counters[ 6 ], counters[ 7 ] );
+			fflush( stderr );
+		}
 		for ( int round = 1; supersample && counters[ 7 ] != 0 && counters[ 2 ] == 0 && round < subsampleRounds; ++round )
 		{
-			RunBatch( slot, [&]( VkCommandBuffer cmd ){
+			if ( jobLog ) {
+				fprintf( stderr, "  round %d\n", round );
+				fflush( stderr );
+			}
+			if ( !RunBatch( slot, [&]( VkCommandBuffer cmd ){
 				vkCmdFillBuffer( cmd, slot->jobCounters.buffer, 28, 4, 0 );
 				Barrier( cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, compute, readWrite );
 				mark( cmd, 2 );
 				recordRound( cmd, round == subsampleRounds - 1 );
 				recordFinish( cmd );
-			} );
-			timestamps();
-			ReadBuffer( slot->readback, counters, sizeof( counters ) );
+			} )
+			  || !ReadBuffer( slot->readback, counters, sizeof( counters ) ) ) {
+				return failed();
+			}
+			timestamps( round );
 		}
 		first = false;
 		begin = end;
@@ -1307,7 +1524,9 @@ bool GpuIlluminateLightmap( const GpuLightmapJob& job ){
 	{
 		uint32_t counters[ 8 ];
 		std::vector<char> result( numLuxels * 16 + 32 );
-		ReadBuffer( slot->readback, result.data(), result.size() );
+		if ( !ReadBuffer( slot->readback, result.data(), result.size() ) ) {
+			return failed();
+		}
 		memcpy( counters, result.data(), sizeof( counters ) );
 		statPausedLights += counters[ 6 ];
 		statOverflowRays += counters[ 0 ];
@@ -1388,6 +1607,14 @@ void GpuShutdown(){
 	Sys_Printf( "%9lld lightmaps lit on the GPU (%.1f s summed over threads), %lld redone on the CPU (rays with too many surfaces %lld, too deep in the bsp %lld, lights with too many unpredicted subsamples %lld)\n",
 	            statLightmaps.load(), statLightMicroseconds.load() * 1e-6, statLightmapFallbacks.load(), statOverflowRays.load(), statSolidOverflowRays.load(), statUnpredictedStamps.load() );
 	Sys_Printf( "%9lld light walks paused for another subsampling round (%d rounds)\n", statPausedLights.load(), subsampleRounds );
+	if ( statLimitLightmaps != 0 ) {
+		Sys_Printf( "%9lld lightmaps lit on the CPU, beyond the GPU's dispatch limits\n", statLimitLightmaps.load() );
+	}
+	if ( gpuFailed ) {
+		/* the GPU may still be busy or hung: its objects are left to the driver, which frees them at exit */
+		Sys_Printf( "%9lld lightmaps redone on the CPU when the GPU failed\n", statFailedLightmaps.load() );
+		return;
+	}
 	vkDeviceWaitIdle( device );
 	for ( auto& slot : allSlots )
 	{
@@ -1427,6 +1654,9 @@ void GpuShutdown(){
 
 /* built without Vulkan: -gpu is never enabled */
 bool GpuSetup( const GpuScene& ){
+	return false;
+}
+bool GpuFailed(){
 	return false;
 }
 void GpuTrace( const GpuRay *, GpuHit *, size_t, const int *, size_t ){
