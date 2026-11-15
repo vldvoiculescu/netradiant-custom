@@ -73,6 +73,159 @@ int GetThreadWork(){
 }
 
 
+/*
+   thread profiling - debugging aid
+   when env Q3MAP2_DEBUG_THREADPROFILE names a file, every RunThreadsOnIndividual call writes
+   its wall time, the time spent in work items, the serial time since the previous call,
+   when the last item was handed out, and the slowest items.
+ */
+
+#include <chrono>
+#include <vector>
+#include <algorithm>
+
+namespace
+{
+using ProfileClock = std::chrono::steady_clock;
+
+struct ProfileItem
+{
+	double start, end;
+	int thread;
+};
+
+struct ThreadProfile
+{
+	FILE *file = nullptr;
+	ProfileClock::time_point origin = ProfileClock::now();
+	double lastEnd = 0;
+	int call = 0;
+	std::vector<ProfileItem> items;
+
+	ThreadProfile(){
+		if ( const char *path = getenv( "Q3MAP2_DEBUG_THREADPROFILE" ) ) {
+			file = fopen( path, "wt" );
+		}
+	}
+	~ThreadProfile(){
+		if ( file != nullptr ) {
+			fprintf( file, "end %.4f serial_before %.4f\n", now(), now() - lastEnd );
+			fclose( file );
+		}
+	}
+	double now() const {
+		return std::chrono::duration<double>( ProfileClock::now() - origin ).count();
+	}
+};
+
+ThreadProfile g_threadProfile;
+}
+
+
+/*
+   ParallelFor jobs
+   a RunThreadsOnIndividual item can split its own work with ParallelFor. threads that have no
+   items left help with those jobs (like a task scheduler's work sharing), so a single huge
+   item no longer keeps one core busy while the others sit idle.
+ */
+
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+
+void ( *threadProfileFlush )() = nullptr;
+
+namespace
+{
+std::atomic<double> g_counterSeconds;
+std::atomic<long long> g_counterCalls;
+}
+
+bool ThreadProfileEnabled(){
+	return g_threadProfile.file != nullptr;
+}
+
+void ThreadProfileAddCounter( double seconds, long long calls ){
+	g_counterSeconds.fetch_add( seconds );
+	g_counterCalls.fetch_add( calls );
+}
+
+bool threadsHelpWithJobs = false;
+
+namespace
+{
+struct ParallelJob
+{
+	const std::function<void( int )> *fn;
+	int count;
+	std::atomic<int> next{ 0 };
+	std::atomic<int> done{ 0 };
+};
+
+std::mutex g_jobMutex;
+std::condition_variable g_jobCond;
+std::vector<ParallelJob*> g_jobs;               /* active jobs, guarded by g_jobMutex */
+int g_itemsDone;                                /* finished RunThreadsOnIndividual items, guarded by g_jobMutex */
+std::atomic<double> g_helpSeconds;              /* profiling: time idle workers spent on job indexes */
+
+/* runs one pending index of any active job; lock is held on entry and exit */
+bool HelpWithJob( std::unique_lock<std::mutex>& lock, bool profile ){
+	for ( ParallelJob *job : g_jobs )
+	{
+		const int i = job->next.fetch_add( 1 );
+		if ( i < job->count ) {
+			lock.unlock();
+			const double start = profile ? g_threadProfile.now() : 0;
+			( *job->fn )( i );
+			if ( profile ) {
+				g_helpSeconds.fetch_add( g_threadProfile.now() - start );
+			}
+			lock.lock();
+			if ( ++job->done == job->count ) {
+				g_jobCond.notify_all();
+			}
+			return true;
+		}
+	}
+	return false;
+}
+}
+
+void ParallelFor( int count, const std::function<void( int )>& fn ){
+	if ( !threadsHelpWithJobs || !threaded || numthreads <= 1 || count <= 1 ) {
+		for ( int i = 0; i < count; ++i )
+			fn( i );
+		return;
+	}
+
+	ParallelJob job;
+	job.fn = &fn;
+	job.count = count;
+
+	std::unique_lock<std::mutex> lock( g_jobMutex );
+	g_jobs.push_back( &job );
+	g_jobCond.notify_all();
+
+	while ( job.done < count )
+	{
+		/* own indexes first */
+		const int i = job.next.fetch_add( 1 );
+		if ( i < count ) {
+			lock.unlock();
+			fn( i );
+			lock.lock();
+			++job.done;
+			continue;
+		}
+		/* the rest are being run by helpers: help others meanwhile, or wait */
+		if ( !HelpWithJob( lock, false ) ) {
+			g_jobCond.wait( lock );
+		}
+	}
+
+	g_jobs.erase( std::find( g_jobs.begin(), g_jobs.end(), &job ) );
+}
+
 void ( *workfunction )( int );
 
 void ThreadWorkerFunction( int threadnum ){
@@ -83,8 +236,81 @@ void ThreadWorkerFunction( int threadnum ){
 			break;
 		}
 //Sys_Printf ("thread %i, work %i\n", threadnum, work);
-		workfunction( work );
+		if ( g_threadProfile.file != nullptr ) {
+			ProfileItem& item = g_threadProfile.items[ work ];
+			item.thread = threadnum;
+			item.start = g_threadProfile.now();
+			workfunction( work );
+			item.end = g_threadProfile.now();
+		}
+		else{
+			workfunction( work );
+		}
+		if ( threadsHelpWithJobs ) {
+			std::lock_guard<std::mutex> lock( g_jobMutex );
+			if ( ++g_itemsDone == workcount ) {
+				g_jobCond.notify_all();
+			}
+		}
 	}
+
+	/* no items left to start: help the items still running until all of them are done */
+	if ( threadsHelpWithJobs ) {
+		std::unique_lock<std::mutex> lock( g_jobMutex );
+		while ( true )
+		{
+			if ( HelpWithJob( lock, g_threadProfile.file != nullptr ) ) {
+				continue;
+			}
+			if ( g_itemsDone == workcount ) {
+				break;
+			}
+			g_jobCond.wait( lock );
+		}
+	}
+
+	if ( threadProfileFlush != nullptr && g_threadProfile.file != nullptr ) {
+		threadProfileFlush();
+	}
+}
+
+static void ThreadProfileReport( int workcnt, bool showpacifier, double start ){
+	ThreadProfile& p = g_threadProfile;
+	const double end = p.now();
+	const double wall = end - start;
+	double busy = 0, lastStart = start, maxItem = 0;
+	std::vector<double> threadBusy( std::max( numthreads, 1 ), 0 );
+	std::vector<int> order( workcnt );
+	busy += g_helpSeconds.load();
+	for ( int i = 0; i < workcnt; ++i )
+	{
+		const ProfileItem& item = p.items[ i ];
+		busy += item.end - item.start;
+		threadBusy[ std::clamp( item.thread, 0, int( threadBusy.size() ) - 1 ) ] += item.end - item.start;
+		lastStart = std::max( lastStart, item.start );
+		maxItem = std::max( maxItem, item.end - item.start );
+		order[ i ] = i;
+	}
+	const int top = std::min( workcnt, 8 );
+	std::partial_sort( order.begin(), order.begin() + top, order.end(), [&p]( int a, int b ){
+		return p.items[ a ].end - p.items[ a ].start > p.items[ b ].end - p.items[ b ].start;
+	} );
+	fprintf( p.file, "call %d pacifier %d items %d threads %d start %.4f serial_before %.4f wall %.4f busy %.4f efficiency %.3f last_dispatch %.4f tail %.4f max_item %.4f\n",
+	         p.call, showpacifier, workcnt, numthreads, start, start - p.lastEnd, wall, busy,
+	         wall > 0 ? busy / ( wall * std::max( numthreads, 1 ) ) : 1.0, lastStart - start, end - lastStart, maxItem );
+	if ( g_counterCalls != 0 ) {
+		fprintf( p.file, "  counter %.4f s, %lld calls, %.1f%% of busy\n", g_counterSeconds.load(), g_counterCalls.load(), busy > 0 ? 100 * g_counterSeconds.load() / busy : 0.0 );
+	}
+	fprintf( p.file, "  slowest" );
+	for ( int i = 0; i < top; ++i )
+		fprintf( p.file, " %d:%.4f@%.4f", order[ i ], p.items[ order[ i ] ].end - p.items[ order[ i ] ].start, p.items[ order[ i ] ].start - start );
+	fprintf( p.file, "\n  thread_busy" );
+	for ( const double b : threadBusy )
+		fprintf( p.file, " %.3f", b );
+	fprintf( p.file, "\n" );
+	fflush( p.file );
+	p.lastEnd = end;
+	p.call++;
 }
 
 void RunThreadsOn( void ( *func )( int ) );
@@ -94,6 +320,14 @@ void RunThreadsOnIndividual( int workcnt, bool showpacifier, void ( *func )( int
 		ThreadSetDefault();
 	}
 	Timer timer;
+	const double profileStart = g_threadProfile.file != nullptr ? g_threadProfile.now() : 0;
+	if ( g_threadProfile.file != nullptr ) {
+		g_threadProfile.items.assign( workcnt, ProfileItem{ profileStart, profileStart, -1 } );
+		g_helpSeconds = 0;
+		g_counterSeconds = 0;
+		g_counterCalls = 0;
+	}
+	g_itemsDone = 0;
 
 	dispatch = 0;
 	workcount = workcnt;
@@ -102,6 +336,10 @@ void RunThreadsOnIndividual( int workcnt, bool showpacifier, void ( *func )( int
 
 	workfunction = func;
 	RunThreadsOn( ThreadWorkerFunction );
+
+	if ( g_threadProfile.file != nullptr ) {
+		ThreadProfileReport( workcnt, showpacifier, profileStart );
+	}
 
 	if ( pacifier ) {
 		Sys_Printf( " (%i)\n", int( timer.elapsed_sec() ) );
@@ -648,4 +886,33 @@ void RunThreadsOn( int workcnt, bool showpacifier, void ( *func )( int ) ){
 
 #endif
 
+#endif
+
+
+/*
+   ThreadSetLowPriority
+   lets the whole process run below normal priority, so interactive programs stay responsive
+   while compiling; it still gets all of the cpu that they leave idle.
+   (deliberately not the stronger background/efficiency modes, which would also limit
+   the process to efficiency cores and throttle its io on hybrid cpus)
+ */
+
+#ifdef WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
+bool ThreadSetLowPriority(){
+	return SetPriorityClass( GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS );
+}
+#else
+#include <sys/resource.h>
+
+bool ThreadSetLowPriority(){
+	return setpriority( PRIO_PROCESS, 0, 10 ) == 0;
+}
 #endif

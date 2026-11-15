@@ -1800,6 +1800,9 @@ int                         LightMain( Args& args );
 /* light_trace.c */
 void                        SetupTraceNodes();
 void                        TraceLine( trace_t *trace );
+bool                        DebugCounterEnabled( const char *name );
+unsigned long long          DebugCounterStart();
+void                        DebugCounterStop( unsigned long long start );
 float                       SetupTrace( trace_t *trace );
 
 
@@ -1818,6 +1821,7 @@ void                        MapRawLightmap( int num );
 
 void                        SetupDirt();
 void                        DirtyRawLightmap( int num );
+void                        GpuPrepareLights();
 
 void                        SetupFloodLight();
 void                        FloodlightRawLightmaps();
@@ -2096,6 +2100,9 @@ inline bool noGridLighting;
 
 inline bool noTrace;
 inline bool noSurfaces;
+inline bool lightEmbree;                /* -embree: trace rays with Intel Embree */
+inline bool lightCull;                  /* -lightcull: only light the lightmap tiles a light can reach */
+inline bool lightGpu;                   /* -gpu: trace rays on a Vulkan GPU */
 inline bool patchShadows;
 inline bool cpmaHack;
 
